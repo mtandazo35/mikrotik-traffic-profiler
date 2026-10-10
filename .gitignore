@@ -1,0 +1,7 @@
+# Datos reales de routers y abonados: nunca al repo
+data/
+inventario.json
+*.tsv
+*.tsv.gz
+__pycache__/
+*.pyc

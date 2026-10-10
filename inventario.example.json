@@ -1,0 +1,25 @@
+{
+  "maximo_conexiones_por_cidr": 150000,
+  "routers": {
+    "core-ejemplo": {
+      "host": "192.0.2.1",
+      "puerto": 22,
+      "usuario": "lectura",
+      "transporte": "ssh",
+      "categorias": {
+        "residencial": ["100.64.0.0/22", "100.64.8.0/23"],
+        "empresarial": ["198.51.100.0/26"]
+      }
+    },
+    "core-con-clave": {
+      "host": "192.0.2.2",
+      "puerto": 2222,
+      "usuario": "lectura",
+      "transporte": "plink",
+      "password_env": "MTP_CLAVE_CORE_CON_CLAVE",
+      "categorias": {
+        "residencial": ["10.20.0.0/22"]
+      }
+    }
+  }
+}
