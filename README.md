@@ -14,14 +14,33 @@ diseñar el firewall de cada categoría con evidencia y no a ojo.
 El agente de Claude Code `trafico-mikrotik` (`.claude/agents/trafico-mikrotik.md`) usa este CLI, interpreta el
 perfil y propone la capa de firewall de la categoría (`propuestas/`), siempre en fase de detección primero.
 
-## Uso
+## Servidor con panel web
+
+```sh
+apt-get install -y git
+git clone https://github.com/mtandazo35/mikrotik-traffic-profiler /opt/mikrotik-traffic-profiler
+bash /opt/mikrotik-traffic-profiler/deploy/install.sh            # --puerto 8080 por defecto
+```
+
+Deja: usuario de servicio `mtp`; llave RSA 4096 para los routers (RouterOS 6 no acepta ed25519) en
+`/var/lib/mikrotik-traffic-profiler/.ssh/`; configuración en `/etc/mikrotik-traffic-profiler/` (inventario,
+`mtp.env`, `web.json` con la clave del panel en PBKDF2); datos en `/var/lib/mikrotik-traffic-profiler/data/`.
+Servicios: `mtp-web` (panel), `mtp-analizar.timer` (23:30) y, por router, `mtp-recolectar@<router>.timer`
+(09:00, 15:00, 20:30 y 21:30 hora de Ecuador; 4 muestras cada 15 min). La clave del panel se muestra una sola vez;
+se cambia con `python3 -m mtp.web --config /etc/mikrotik-traffic-profiler/web.json --cambiar-clave` (lee de stdin).
+
+El panel muestra routers, muestras, descubrimientos, informes, tareas y timers, lanza las mismas acciones de solo
+lectura que el CLI y trae su apartado de Documentación. Actualizar:
+`git -C /opt/mikrotik-traffic-profiler pull && systemctl restart mtp-web`.
+
+## Uso del CLI
 
 ```sh
 cp inventario.example.json inventario.json   # completar routers, acceso y CIDR por categoría
 python trafico.py descubrir  --router core-a                 # pools, NAT, filtros, conntrack (solo print)
 python trafico.py contar     --router core-a --categoria residencial
 python trafico.py recolectar --router core-a --categoria residencial --repetir 4 --intervalo 15
-curl -Lo data/ip2asn-v4.tsv.gz https://iptoasn.com/data/ip2asn-v4.tsv.gz
+python trafico.py asn                                       # baja/refresca la tabla IP→ASN (>7 días)
 python trafico.py analizar   --categoria residencial --ip2asn data/ip2asn-v4.tsv.gz
 ```
 
