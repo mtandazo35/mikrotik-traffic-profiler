@@ -1,0 +1,12 @@
+[Unit]
+Description=Franjas de muestreo del router %i (manana, tarde y pico nocturno)
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 America/Guayaquil
+OnCalendar=*-*-* 15:00:00 America/Guayaquil
+OnCalendar=*-*-* 20:30:00 America/Guayaquil
+OnCalendar=*-*-* 21:30:00 America/Guayaquil
+RandomizedDelaySec=120
+
+[Install]
+WantedBy=timers.target

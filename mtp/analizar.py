@@ -64,6 +64,13 @@ def muestras(datos, categoria, routers=None):
                 yield router, m["ts"], m["cidr"], manifiesto.parent / m["archivo"]
 
 
+def leer_muestra(ruta):
+    if ruta.suffix == ".gz":
+        with gzip.open(ruta, "rt", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    return ruta.read_text(encoding="utf-8", errors="replace")
+
+
 def _nuevo():
     return {"conexiones": 0, "abonados": set(), "bytes": 0}
 
@@ -87,7 +94,7 @@ def analizar(datos, categoria, routers=None, asn=None):
         por_router[router]["muestras"] += 1
         en_muestra = defaultdict(lambda: {"conexiones": 0, "udp": 0, "puertos": set(), "ips": set(), "syn": 0})
         destinos_por_puerto = defaultdict(set)
-        for con in leer(ruta.read_text(encoding="utf-8")):
+        for con in leer(leer_muestra(ruta)):
             c = clasificar(con, redes)
             if not c:
                 continue

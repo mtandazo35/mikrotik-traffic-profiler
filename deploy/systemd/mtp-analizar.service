@@ -1,0 +1,23 @@
+[Unit]
+Description=Perfil diario de trafico por categoria
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=mtp
+Group=mtp
+WorkingDirectory=/opt/mikrotik-traffic-profiler
+Environment=TZ=America/Guayaquil PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/mikrotik-traffic-profiler/mtp.env
+ExecCondition=/bin/sh -c 'ls /var/lib/mikrotik-traffic-profiler/data/crudo/*/${CATEGORIA}/muestras.jsonl >/dev/null 2>&1'
+ExecStartPre=-/usr/bin/python3 trafico.py --datos /var/lib/mikrotik-traffic-profiler/data asn
+ExecStart=/usr/bin/python3 trafico.py --datos /var/lib/mikrotik-traffic-profiler/data analizar --categoria ${CATEGORIA} --ip2asn /var/lib/mikrotik-traffic-profiler/data/ip2asn-v4.tsv.gz
+TimeoutStartSec=1h
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/mikrotik-traffic-profiler

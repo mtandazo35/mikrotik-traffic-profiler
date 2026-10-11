@@ -2,6 +2,7 @@
 
 Toda orden pasa por `comprobar_lectura`: si no es un `print` se rechaza antes de abrir SSH.
 """
+import gzip
 import json
 import os
 import re
@@ -71,6 +72,9 @@ def ejecutar(router, comando, timeout=300):
         cmd = [
             "ssh", "-o", "StrictHostKeyChecking=no", "-o", f"UserKnownHostsFile={os.devnull}",
             "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "LogLevel=ERROR",
+            # RouterOS 6 solo habla ssh-rsa (SHA-1) y DH group14-sha1; OpenSSH moderno los trae apagados
+            "-o", "HostKeyAlgorithms=+ssh-rsa", "-o", "PubkeyAcceptedAlgorithms=+ssh-rsa",
+            "-o", "KexAlgorithms=+diffie-hellman-group14-sha1",
             "-p", puerto, f"{usuario}@{router['host']}", comando,
         ]
     r = subprocess.run(cmd, input=entrada, capture_output=True, text=True, timeout=timeout,
@@ -121,9 +125,10 @@ def muestrear(router, nombre, categoria, datos, maximo):
         if n > maximo:
             entrada["omitida"] = f"{n} conexiones > máximo {maximo}; partir el CIDR en trozos más chicos"
         else:
-            archivo = carpeta / f"{marca}_{cidr.replace('/', '_')}.txt"
-            archivo.write_text(ejecutar(router, f"/ip firewall connection print terse without-paging {_filtro(cidr)}"),
-                               encoding="utf-8")
+            archivo = carpeta / f"{marca}_{cidr.replace('/', '_')}.txt.gz"
+            texto = ejecutar(router, f"/ip firewall connection print terse without-paging {_filtro(cidr)}")
+            with gzip.open(archivo, "wt", encoding="utf-8") as f:  # ~10x menos disco
+                f.write(texto)
             entrada["archivo"] = archivo.name
         with (carpeta / "muestras.jsonl").open("a", encoding="utf-8") as f:
             f.write(json.dumps(entrada, ensure_ascii=False) + "\n")

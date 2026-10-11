@@ -1,3 +1,4 @@
+import gzip
 import json
 import tempfile
 import unittest
@@ -26,9 +27,10 @@ class TestAnalizar(unittest.TestCase):
         ]
         # 60 destinos distintos al 23 desde un solo abonado = barrido
         lineas += [_linea("100.64.1.14:6000", f"198.51.100.{i}:23", estado="syn-sent") for i in range(1, 61)]
-        (carpeta / "m1.txt").write_text("\n".join(lineas), encoding="utf-8")
+        with gzip.open(carpeta / "m1.txt.gz", "wt", encoding="utf-8") as f:
+            f.write("\n".join(lineas))
         (carpeta / "muestras.jsonl").write_text(
-            json.dumps({"ts": "20261010-203000", "cidr": "100.64.1.0/24", "archivo": "m1.txt"}) + "\n"
+            json.dumps({"ts": "20261010-203000", "cidr": "100.64.1.0/24", "archivo": "m1.txt.gz"}) + "\n"
             + json.dumps({"ts": "20261010-203100", "cidr": "100.64.2.0/24", "omitida": "demasiadas"}) + "\n",
             encoding="utf-8")
 
