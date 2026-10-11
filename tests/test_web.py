@@ -34,6 +34,16 @@ class TestCredenciales(unittest.TestCase):
         self.assertNotIn("/file add", v6)  # no existe en RouterOS 6
         self.assertIn("/user remove [find name=trafico]", quitar)
 
+    def test_comandos_netflow(self):
+        buscar, activar, ver, quitar = web.comandos_netflow("192.0.2.8", 2055)
+        self.assertIn("/ip traffic-flow target add dst-address=192.0.2.8 port=2055 version=9", activar)
+        self.assertIn("interfaces=INTERFAZ-CLIENTES", activar)
+        self.assertIn("enabled=yes", activar)
+        self.assertIn("/ip traffic-flow target remove [find dst-address=192.0.2.8]", quitar)
+        self.assertIn("/ip traffic-flow print", ver)
+        # el script de búsqueda solo lee
+        self.assertTrue(all(l.startswith("#") or " print" in l for l in buscar.splitlines()))
+
     def test_archivo_seguro(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "a.json").write_text("{}")
@@ -87,6 +97,7 @@ class TestServidor(unittest.TestCase):
         self.assertEqual(st, 200)
         self.assertIn("core-a", cuerpo)
         self.assertIn("Conectar un router", cuerpo)
+        self.assertIn("Exportar NetFlow", cuerpo)
         st, _, cuerpo = self._pedir("GET", "/doc", cookie=cookie)
         self.assertIn("Documentación", cuerpo)
         st, cab, _ = self._pedir("POST", "/accion", {"accion": "set", "router": "core-a"}, cookie=cookie)

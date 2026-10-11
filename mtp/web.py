@@ -165,6 +165,28 @@ def comandos_router(llave, ip):
     return v7, v6, verificar, quitar
 
 
+PUERTO_NETFLOW = 2055
+
+
+def comandos_netflow(ip, puerto=PUERTO_NETFLOW):
+    """Script de Traffic Flow (NetFlow v9, igual en RouterOS 6.43+ y 7): (buscar interfaz, activar, comprobar, quitar)."""
+    buscar = "\n".join([
+        "# en qué interfaz están los gateways de los clientes (bridge o VLAN de clientes)",
+        "/ip address print",
+        "/interface bridge print",
+        "/interface vlan print",
+    ])
+    activar = "\n".join([
+        "# 1) cambiar INTERFAZ-CLIENTES por la interfaz de clientes (varias: separadas por coma, sin espacios)",
+        "#    NUNCA poner la WAN/tránsito: duplica el volumen y no aporta",
+        "/ip traffic-flow set enabled=yes interfaces=INTERFAZ-CLIENTES active-flow-timeout=1m inactive-flow-timeout=15s",
+        f"/ip traffic-flow target add dst-address={ip} port={puerto} version=9",
+    ])
+    verificar = "\n".join(["/ip traffic-flow print", "/ip traffic-flow target print"])
+    quitar = "\n".join([f"/ip traffic-flow target remove [find dst-address={ip}]", "/ip traffic-flow set enabled=no"])
+    return buscar, activar, verificar, quitar
+
+
 # ---------- HTML ----------
 
 e = html.escape
@@ -273,6 +295,20 @@ servidor con otra IP (NAT o VPN de por medio), cambiar <code>address=</code> por
 <p class=mut>Hecho esto, pasar IP, puerto SSH y rangos de cada categoría para darlo de alta en el inventario.</p>"""
     else:
         conectar = "<p class=bad>No se encontró la llave pública del servidor (reinstalar con deploy/install.sh).</p>"
+    ip_col = CFG.get("ip_origen") or "IP_DE_ESTE_SERVIDOR"
+    nf_buscar, nf_activar, nf_ver, nf_quitar = comandos_netflow(ip_col)
+    netflow = f"""<p>Hace que el router envíe a <b>{e(ip_col)}</b> (UDP {PUERTO_NETFLOW}) un registro de <b>cada conexión</b> de los clientes:
+IP y puerto de origen y destino, protocolo, bytes y paquetes. Es lo mismo en RouterOS 6.43+ y 7. Es un cambio en el router: aplicarlo con respaldo
+(<code>/system backup save</code>) y en Safe Mode.</p>
+<h3>1. Encontrar la interfaz de clientes</h3>{_copiable("nf-buscar", nf_buscar)}
+<p class=mut>Es la interfaz que tiene la IP gateway de los clientes (por ejemplo <code>100.64.0.1/22</code>). Si los clientes van por VLAN
+montada sobre un bridge, poner el <b>bridge</b>. Si los clientes entran por <b>PPPoE</b>, avisar antes de aplicar: ese caso necesita otra configuración.</p>
+<h3>2. Activar NetFlow</h3>{_copiable("nf-activar", nf_activar)}
+<p class=mut>Reemplazar <code>INTERFAZ-CLIENTES</code> antes de pegar. Si el router llega a este servidor saliendo con otra IP (VPN, NAT),
+anotar esa IP en Routers → «IP desde la que exporta NetFlow». El tráfico acelerado por hardware (hw-offload) no se exporta.</p>
+<h3>3. Comprobar</h3>{_copiable("nf-ver", nf_ver)}
+<p class=mut>Debe salir <code>enabled: yes</code>, la interfaz correcta y un target hacia {e(ip_col)}:{PUERTO_NETFLOW} versión 9.</p>
+<h3>Quitar</h3>{_copiable("nf-quitar", nf_quitar)}"""
     return pagina("Panel", f"""
 <h1>Panel</h1>
 <div class=card><h2>Routers</h2>{routers}</div>
@@ -280,6 +316,7 @@ servidor con otra IP (NAT o VPN de por medio), cambiar <code>address=</code> por
 <div class=card><h2>Tareas recientes</h2>{'<table>' + ''.join(tareas) + '</table>' if tareas else '<p class=mut>Sin tareas todavía.</p>'}</div>
 <div class=card><h2>Programación (systemd)</h2><pre>{e(_timers())}</pre></div>
 <div class=card><h2>Conectar un router</h2>{conectar}</div>
+<div class=card><h2>Exportar NetFlow</h2>{netflow}</div>
 """, "/", aviso=aviso)
 
 
