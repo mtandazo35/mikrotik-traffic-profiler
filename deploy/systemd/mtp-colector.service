@@ -1,0 +1,33 @@
+[Unit]
+Description=Colector NetFlow v9 (nfcapd) del perfilador de trafico
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=mtp
+Group=mtp
+UMask=0027
+# nfcapd nombra los archivos con la hora local del proceso: en UTC, el procesador no depende de la zona
+Environment=TZ=UTC
+EnvironmentFile=/etc/mikrotik-traffic-profiler/mtp.env
+# -M: un subdirectorio por exportador (alta de routers sin reiniciar); sin -z (con -t, 1.7.5 aborta)
+ExecStart=/usr/bin/nfcapd -C none -4 -M /var/lib/mikrotik-traffic-profiler/data/nfcapd -p ${PUERTO_NETFLOW} -t ${ROTACION_NETFLOW} -B 8388608
+Restart=always
+RestartSec=5
+MemoryMax=256M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+ReadWritePaths=/var/lib/mikrotik-traffic-profiler/data/nfcapd
+
+[Install]
+WantedBy=multi-user.target

@@ -7,22 +7,24 @@ import argparse
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import re
 import secrets
 import socket
+import sqlite3
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
+from datetime import date, datetime
 from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
-from . import inventario
+from . import firewall, inventario
 
 RAIZ = Path(__file__).resolve().parent.parent
 ITERACIONES = 600_000
@@ -31,6 +33,7 @@ CFG = {}
 TAREAS = {}  # nombre de log -> Popen
 _FALLOS = {}  # ip -> (fallos, bloqueado_hasta)
 _CANDADO = threading.Lock()
+FLUJOS = None  # módulo de consultas NetFlow (mtp.flujos_db); las pruebas ponen aquí uno falso
 
 
 # ---------- credenciales y sesión ----------
@@ -104,6 +107,29 @@ def _listar(carpeta, patron):
     return sorted((p.name for p in c.glob(patron)), reverse=True) if c.is_dir() else []
 
 
+def _flujos():
+    """Módulo de consultas NetFlow, importado la primera vez. None si todavía no está instalado."""
+    global FLUJOS
+    if FLUJOS is None:
+        try:
+            from . import flujos_db
+        except ImportError:
+            return None
+        FLUJOS = flujos_db
+    return FLUJOS
+
+
+def _abrir_flujos():
+    """(módulo, conexión de solo lectura) o (módulo, None) si todavía no hay base NetFlow."""
+    F = _flujos()
+    if F is None:
+        return None, None
+    try:
+        return F, F.abrir(_datos(getattr(F, "RUTA_RELATIVA", "flujos.db")), solo_lectura=True)
+    except (OSError, sqlite3.Error):
+        return F, None
+
+
 def _timers():
     try:
         r = subprocess.run(["systemctl", "list-timers", "--all", "--no-pager", "mtp-*"],
@@ -168,22 +194,84 @@ def comandos_router(llave, ip):
 PUERTO_NETFLOW = 2055
 
 
-def comandos_netflow(ip, puerto=PUERTO_NETFLOW):
-    """Script de Traffic Flow (NetFlow v9, igual en RouterOS 6.43+ y 7): (buscar interfaz, activar, comprobar, quitar)."""
+def puerto_netflow():
+    try:
+        return int(os.environ.get("PUERTO_NETFLOW", PUERTO_NETFLOW))
+    except ValueError:
+        return PUERTO_NETFLOW
+
+
+def interfaces_ros(texto):
+    """Valor para interfaces=: nombres separados por coma, toda la lista entre comillas si alguno lleva espacios.
+    None si está vacío o trae caracteres que RouterOS interpretaría dentro de una orden ("…", $, [], {}, ;, \\, =)."""
+    nombres = [n.strip() for n in (texto or "").split(",") if n.strip()]
+    if not nombres or any(len(n) > 64 or re.search(r'["$\[\]{};\\=#]', n) or not n.isprintable() for n in nombres):
+        return None
+    lista = ",".join(nombres)
+    return f'"{lista}"' if " " in lista else lista
+
+
+def comandos_netflow(ip, puerto=PUERTO_NETFLOW, ip_router=None, interfaces=None):
+    """Script de Traffic Flow (NetFlow v9, igual en RouterOS 6.49 y 7): (mirar antes, activar, comprobar, quitar).
+
+    ip = IP del colector (este servidor); ip_router = IP con la que este servidor ve al router (src-address);
+    interfaces = interfaz(es) de clientes, separadas por coma. Lo que falte queda como marcador para reemplazar."""
+    origen = ip_router or "IP_DEL_ROUTER"
+    intf = interfaces_ros(interfaces) or "INTERFAZ-CLIENTES"
+    primera = intf.strip('"').split(",")[0]
+    primera = f'"{primera}"' if " " in primera else primera
     buscar = "\n".join([
+        "# 0) ¿ya exporta a otro colector (otro sistema del ISP)? Mirar enabled, interfaces y los targets",
+        "/ip traffic-flow print",
+        "/ip traffic-flow target print",
         "# en qué interfaz están los gateways de los clientes (bridge o VLAN de clientes)",
         "/ip address print",
         "/interface bridge print",
         "/interface vlan print",
     ])
     activar = "\n".join([
-        "# 1) cambiar INTERFAZ-CLIENTES por la interfaz de clientes (varias: separadas por coma, sin espacios)",
-        "#    NUNCA poner la WAN/tránsito: duplica el volumen y no aporta",
-        "/ip traffic-flow set enabled=yes interfaces=INTERFAZ-CLIENTES active-flow-timeout=1m inactive-flow-timeout=15s",
-        f"/ip traffic-flow target add dst-address={ip} port={puerto} version=9",
+        "# interfaces= es GLOBAL: vale para todos los colectores. Pegar el bloque entero (de { a }):",
+        "# - traffic-flow apagado: lo activa con la interfaz de clientes y agrega el destino.",
+        "# - ya activo (otro colector) con interfaces concretas: NO las cambia, las muestra y solo agrega el destino.",
+        "# - ya activo con interfaces=all (el defecto: incluye la WAN): NO agrega nada; nos llegaría también la WAN.",
+        '# Varias interfaces separadas por coma; nombres con espacios: toda la lista entre comillas, "br clientes,vlan20".',
+        "# Si la VLAN de clientes va sobre un bridge, poner el BRIDGE. NUNCA la WAN. Equipos chicos: cache-entries=64k o 32k.",
+        "# src-address = IP del router con la que este servidor lo ve (la del inventario). Si ya hay un destino",
+        "# hacia este servidor no se agrega otro (duplicaría todas las cifras).",
+        "{",
+        ":local ok true",
+        ":if ([/ip traffic-flow get enabled]) do={",
+        "  :local i [:tostr [/ip traffic-flow get interfaces]]",
+        '  :put ("traffic-flow ya estaba activo (otro colector) con interfaces=" . $i)',
+        '  :if (($i = "all") || ([:len $i] = 0)) do={',
+        "    :set ok false",
+        '    :put "NO se agrega el destino: con interfaces=all llegaria tambien la WAN. Ver Panel > Exportar NetFlow."',
+        "  } else={",
+        '    :put "No se cambia interfaces= (es global). Revisar que ninguna de esas sea la WAN o un enlace de transito."',
+        "  }",
+        "} else={",
+        "  /ip traffic-flow set enabled=yes interfaces=" + intf
+        + " cache-entries=128k active-flow-timeout=1m inactive-flow-timeout=15s",
+        "}",
+        f":if ($ok && ([:len [/ip traffic-flow target find dst-address={ip}]] = 0)) do={{",
+        f"  /ip traffic-flow target add dst-address={ip} port={puerto} version=9 src-address={origen} "
+        "v9-template-refresh=20 v9-template-timeout=1m",
+        "}",
+        "}",
     ])
-    verificar = "\n".join(["/ip traffic-flow print", "/ip traffic-flow target print"])
-    quitar = "\n".join([f"/ip traffic-flow target remove [find dst-address={ip}]", "/ip traffic-flow set enabled=no"])
+    verificar = "\n".join([
+        "/ip traffic-flow print",
+        "/ip traffic-flow target print detail",
+        f"/interface print stats where name={primera}",
+        "/ip firewall nat print where chain=srcnat",
+        "/ip firewall filter print where action=fasttrack-connection",
+        "/interface ethernet switch print",
+    ])
+    quitar = "\n".join([
+        f"/ip traffic-flow target remove [find dst-address={ip}]",
+        "# apaga traffic-flow solo si no queda ningún otro colector",
+        ":if ([:len [/ip traffic-flow target find]] = 0) do={/ip traffic-flow set enabled=no}",
+    ])
     return buscar, activar, verificar, quitar
 
 
@@ -211,6 +299,12 @@ input{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6p
 label.check{display:flex;gap:8px;align-items:center;margin:4px 0 12px}label.check input{width:auto;margin:0}
 .copiable{position:relative}.copiable button{position:absolute;top:6px;right:6px}.copiable pre{padding-right:80px;white-space:pre-wrap;word-break:break-all}
 dialog{border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);max-width:520px}dialog::backdrop{background:#0008}
+select{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%;margin:4px 0 10px}
+form.filtros{display:flex;gap:12px;align-items:flex-end;flex-wrap:wrap}form.filtros label{min-width:160px}form.filtros button{margin-bottom:10px}
+.cifras{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 16px}.cifras div{border-left:3px solid var(--line);padding-left:8px}
+.cifras b{display:block;font-size:18px}svg.horas{width:100%;height:150px;display:block}svg.horas .baj{fill:var(--acc)}svg.horas .sub{fill:var(--warn)}
+.leyenda span{display:inline-block;width:10px;height:10px;margin:0 4px 0 12px;vertical-align:middle}
+tr.malo td{color:var(--bad)}tr.ojo td{color:var(--warn)}details{margin-top:8px}summary{cursor:pointer;color:var(--acc)}
 """
 
 
@@ -225,7 +319,8 @@ JS = """function copiar(id, b) {
 
 def pagina(titulo, cuerpo, activa="", aviso=None, refresco=None):
     nav = "".join(f'<a href="{u}" class="{"on" if u == activa else ""}">{t}</a>' for u, t in
-                  [("/", "Panel"), ("/routers", "Routers"), ("/muestras", "Muestras"), ("/informes", "Informes"), ("/doc", "Documentación")])
+                  [("/", "Panel"), ("/routers", "Routers"), ("/trafico", "Tráfico"), ("/firewall", "Firewall"),
+                   ("/muestras", "Muestras"), ("/informes", "Informes"), ("/doc", "Documentación")])
     modal = ""
     if aviso:
         modal = (f'<dialog id="aviso"><p>{e(aviso)}</p><form method="dialog"><button>Cerrar</button></form></dialog>'
@@ -245,7 +340,7 @@ def _boton(accion, texto, router="", categoria="", sec=False, confirmar=None):
             f'<button class="{"sec" if sec else ""}">{texto}</button></form> ')
 
 
-def vista_panel(aviso=None):
+def vista_panel(aviso=None, nf_router=None, nf_interfaz=None):
     inv = _inventario()
     muestras = _manifiestos()
     filas = []
@@ -296,19 +391,52 @@ servidor con otra IP (NAT o VPN de por medio), cambiar <code>address=</code> por
     else:
         conectar = "<p class=bad>No se encontró la llave pública del servidor (reinstalar con deploy/install.sh).</p>"
     ip_col = CFG.get("ip_origen") or "IP_DE_ESTE_SERVIDOR"
-    nf_buscar, nf_activar, nf_ver, nf_quitar = comandos_netflow(ip_col)
-    netflow = f"""<p>Hace que el router envíe a <b>{e(ip_col)}</b> (UDP {PUERTO_NETFLOW}) un registro de <b>cada conexión</b> de los clientes:
-IP y puerto de origen y destino, protocolo, bytes y paquetes. Es lo mismo en RouterOS 6.43+ y 7. Es un cambio en el router: aplicarlo con respaldo
-(<code>/system backup save</code>) y en Safe Mode.</p>
-<h3>1. Encontrar la interfaz de clientes</h3>{_copiable("nf-buscar", nf_buscar)}
-<p class=mut>Es la interfaz que tiene la IP gateway de los clientes (por ejemplo <code>100.64.0.1/22</code>). Si los clientes van por VLAN
-montada sobre un bridge, poner el <b>bridge</b>. Si los clientes entran por <b>PPPoE</b>, avisar antes de aplicar: ese caso necesita otra configuración.</p>
-<h3>2. Activar NetFlow</h3>{_copiable("nf-activar", nf_activar)}
-<p class=mut>Reemplazar <code>INTERFAZ-CLIENTES</code> antes de pegar. Si el router llega a este servidor saliendo con otra IP (VPN, NAT),
-anotar esa IP en Routers → «IP desde la que exporta NetFlow». El tráfico acelerado por hardware (hw-offload) no se exporta.</p>
-<h3>3. Comprobar</h3>{_copiable("nf-ver", nf_ver)}
-<p class=mut>Debe salir <code>enabled: yes</code>, la interfaz correcta y un target hacia {e(ip_col)}:{PUERTO_NETFLOW} versión 9.</p>
-<h3>Quitar</h3>{_copiable("nf-quitar", nf_quitar)}"""
+    puerto_nf = puerto_netflow()
+    routers_inv = inv.get("routers", {})
+    nf_router = nf_router if nf_router in routers_inv else ""
+    ip_router = None
+    if nf_router:
+        try:
+            ip_router = str(ipaddress.IPv4Address(routers_inv[nf_router].get("exportador") or routers_inv[nf_router].get("host", "")))
+        except ValueError:
+            ip_router = None  # host por nombre: queda el marcador IP_DEL_ROUTER
+    intf = interfaces_ros(nf_interfaz)
+    if nf_interfaz and not intf and not aviso:
+        aviso = "Nombre de interfaz no válido: no puede llevar comillas, $, [], {}, ;, = ni \\. Se dejó el marcador INTERFAZ-CLIENTES."
+    nf_buscar, nf_activar, nf_ver, nf_quitar = comandos_netflow(ip_col, puerto_nf, ip_router, nf_interfaz if intf else None)
+    opciones = "<option value=''>(sin elegir: IP_DEL_ROUTER)</option>" + "".join(
+        f"<option value='{e(n)}'{' selected' if n == nf_router else ''}>{e(n)}</option>" for n in routers_inv)
+    netflow = f"""<p>Hace que el router envíe a <b>{e(ip_col)}</b> (UDP {puerto_nf}) un registro de <b>cada conexión</b> de los clientes:
+IP y puerto de origen y destino, protocolo, bytes y paquetes. Es lo mismo en RouterOS 6.49 y 7 (NetFlow v9). Es un cambio en el router:
+lo aplica el operador, con respaldo (<code>/system backup save</code>) y en Safe Mode. Este sistema nunca lo aplica solo.</p>
+<form method="get" action="/#netflow" class=filtros>
+<label>Router (pone su IP en <code>src-address</code>)<select name="nf_router">{opciones}</select></label>
+<label>Interfaz de clientes (opcional)<input name="nf_interfaz" placeholder="bridge-clientes" value="{e(nf_interfaz or '')}"></label>
+<button class=sec>Generar comandos</button></form>
+<h3>0. Mirar antes y encontrar la interfaz de clientes</h3>{_copiable("nf-buscar", nf_buscar)}
+<p class=mut>Si <code>/ip traffic-flow print</code> ya dice <code>enabled: yes</code>, el router exporta a <b>otro colector</b>:
+<code>interfaces=</code> es global y cambiarlo cambiaría lo que recibe ese otro sistema. El paso 1 lo comprueba solo: si el otro
+colector usa interfaces concretas, no las toca, las muestra (revisar que ninguna sea la WAN) y solo agrega el destino. Si usa
+<code>interfaces=all</code> (el valor por defecto), <b>no agrega nada</b>: nos llegaría también la WAN, que multiplica el volumen y ya
+tumbó un servidor. En ese caso hay que acordar con el dueño del otro colector cambiar <code>interfaces=</code> a la de clientes
+(también le conviene) o no exportar a este servidor desde ese router. La interfaz de clientes es la que tiene la IP gateway de los clientes (por ejemplo <code>100.64.0.1/22</code>);
+si los clientes van por VLAN montada sobre un bridge, poner el <b>bridge</b>. Si entran por <b>PPPoE</b>, avisar antes de aplicar:
+ese caso necesita otra configuración.</p>
+<h3>1. Activar NetFlow</h3>{_copiable("nf-activar", nf_activar)}
+<p class=mut>Reemplazar <code>INTERFAZ-CLIENTES</code> (o escribirla arriba) y, si no se eligió router, <code>IP_DEL_ROUTER</code> antes de pegar.
+Nombres con espacios: toda la lista entre comillas. <code>cache-entries=128k</code> evita que un core llene la tabla (4k por defecto);
+en equipos chicos, 64k o 32k. <code>src-address</code> es la IP con la que este servidor reconoce al router: si el envío sale por NAT o VPN
+con otra IP, anotarla en Routers → «IP desde la que exporta NetFlow», o aparecerá como <b>exportador desconocido</b> en Tráfico → Salud.
+Con poco tráfico la plantilla v9 puede tardar <b>varios minutos</b> en llegar (<code>v9-template-timeout=1m</code> la reenvía cada minuto):
+mientras tanto llegan archivos con 0 flujos. El tráfico acelerado por hardware (hw-offload) no se exporta.</p>
+<h3>2. Comprobar</h3>{_copiable("nf-ver", nf_ver)}
+<p class=mut>Debe salir <code>enabled: yes</code>, la interfaz correcta y un target hacia {e(ip_col)}:{puerto_nf} versión 9. Ninguna regla
+srcnat debe cambiar el origen del envío hacia {e(ip_col)} (si la hay, el operador decide una excepción
+<code>chain=srcnat dst-address={e(ip_col)} action=accept</code> arriba de todo). FastTrack con <code>hw-offload=yes</code> o
+<code>l3-hw-offloading: yes</code> en el switch (v7) = ese tráfico no se exporta. En <a href="/trafico">Tráfico → Salud</a> el router
+debe aparecer con archivos del último minuto.</p>
+<h3>Quitar</h3>{_copiable("nf-quitar", nf_quitar)}
+<p class=mut>Quita solo el destino hacia este servidor; apaga Traffic Flow únicamente si no queda ningún otro colector.</p>"""
     return pagina("Panel", f"""
 <h1>Panel</h1>
 <div class=card><h2>Routers</h2>{routers}</div>
@@ -316,7 +444,7 @@ anotar esa IP en Routers → «IP desde la que exporta NetFlow». El tráfico ac
 <div class=card><h2>Tareas recientes</h2>{'<table>' + ''.join(tareas) + '</table>' if tareas else '<p class=mut>Sin tareas todavía.</p>'}</div>
 <div class=card><h2>Programación (systemd)</h2><pre>{e(_timers())}</pre></div>
 <div class=card><h2>Conectar un router</h2>{conectar}</div>
-<div class=card><h2>Exportar NetFlow</h2>{netflow}</div>
+<div class=card id="netflow"><h2>Exportar NetFlow</h2>{netflow}</div>
 """, "/", aviso=aviso)
 
 
@@ -461,6 +589,417 @@ Destinos por {e(r['destinos_agrupados_por'])}</p>
 """, "/informes")
 
 
+# ---------- NetFlow: Tráfico y Firewall ----------
+
+SIN_NETFLOW = """<div class=card><h2>Todavía no hay datos NetFlow</h2>
+<p>El colector aún no recibió ni procesó flujos de ningún router. Configurar el envío con los comandos de
+<a href="/#netflow">Panel → Exportar NetFlow</a> y esperar un par de minutos: cada archivo es un minuto y se procesa al cerrarse;
+con poco tráfico la plantilla v9 puede tardar varios minutos más.</p></div>"""
+
+_PERCENTILES = (("flujos", "Flujos distintos (5-tuplas)"), ("tcp_nuevas", "Conexiones TCP nuevas (SYN)"),
+                ("udp", "Flujos UDP distintos"), ("ips", "IP remotas distintas"), ("puertos", "Puertos remotos distintos"),
+                ("peers_udp", "Pares UDP (P2P)"), ("syn", "TCP sin respuesta (SYN sin ACK)"))
+_ORDEN_DESTINOS = ("bytes", "abonados")
+_ORDEN_CONSUMO = ("bajada", "subida", "total", "flujos")
+_CATEGORIA = re.compile(r"[\w-]{1,40}", re.ASCII)
+
+
+def _t(v):
+    """Texto de la base, escapado; '—' si falta."""
+    return "—" if v is None or v == "" else e(str(v))
+
+
+def _num(v):
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return _t(v)
+    texto = f"{v:,.1f}" if isinstance(v, float) else f"{v:,}"
+    return texto.replace(",", " ")
+
+
+def _b(v):
+    return _bytes(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else "—"
+
+
+def _tabla(columnas, filas, vacio="Sin datos en el periodo."):
+    """columnas = [(título, numérica)]; filas = listas de celdas YA escapadas (usar _t, _num, _b)."""
+    cab = "".join(("<th class=n>" if n else "<th>") + t + "</th>" for t, n in columnas)
+    cuerpo = []
+    for f in filas:
+        clase = ""
+        if isinstance(f, tuple):  # (clase de fila, celdas)
+            clase, f = f
+        celdas = "".join(("<td class=n>" if n else "<td>") + c + "</td>" for c, (_, n) in zip(f, columnas))
+        cuerpo.append(f"<tr class='{clase}'>{celdas}</tr>" if clase else f"<tr>{celdas}</tr>")
+    if not cuerpo:
+        cuerpo = [f"<tr><td colspan={len(columnas)} class=mut>{vacio}</td></tr>"]
+    return f"<table><tr>{cab}</tr>{''.join(cuerpo)}</table>"
+
+
+def _selector(nombre, opciones, actual, todos=None):
+    ops = [f"<option value=''>{e(todos)}</option>"] if todos is not None else []
+    ops += [f"<option value='{e(o)}'{' selected' if o == actual else ''}>{e(o)}</option>" for o in opciones]
+    return f"<select name='{nombre}'>{''.join(ops)}</select>"
+
+
+def _filtros(q, routers, categorias, periodos=None, defecto="hoy"):
+    """Valida router (vacío o conocido), categoría (^[\\w-]+$) y periodo. Lo inválido vuelve al valor por defecto
+    y deja un aviso para el modal; el valor recibido nunca se pinta sin escapar."""
+    avisos = []
+    router = q.get("router") or ""
+    if router and router not in routers:
+        avisos.append(f"Router «{router[:60]}» desconocido: se muestran todos los routers.")
+        router = ""
+    categoria = q.get("categoria") or ""
+    if categoria and not _CATEGORIA.fullmatch(categoria):
+        avisos.append(f"Categoría «{categoria[:60]}» no válida.")
+        categoria = ""
+    if not categoria:
+        categoria = "residencial" if "residencial" in categorias or not categorias else categorias[0]
+    periodo = q.get("periodo") or defecto
+    if periodos is not None and periodo not in periodos:
+        avisos.append(f"Periodo «{periodo[:60]}» desconocido (válidos: {', '.join(periodos)}): se usa «{defecto}».")
+        periodo = defecto
+    return router, categoria, periodo, avisos
+
+
+def _grafico_horas(serie):
+    """Barras apiladas bajada/subida en SVG en línea (sin librerías). Cada barra trae su detalle en <title>."""
+    if not serie:
+        return "<p class=mut>Sin datos en el periodo.</p>"
+    valores = [((s.get("bytes_bajada") or 0), (s.get("bytes_subida") or 0)) for s in serie]
+    maximo = max(b + s for b, s in valores) or 1
+    ancho, alto = 10, 100
+    barras = []
+    for i, (s, (baj, sub)) in enumerate(zip(serie, valores)):
+        hb, hs = baj * alto / maximo, sub * alto / maximo
+        detalle = (f"{_t(s.get('inicio'))}: bajada {_b(baj)}, subida {_b(sub)}, {_num(s.get('flujos'))} flujos, "
+                   f"{_num(s.get('abonados_max_ventana'))} abonados (máx. por minuto)")
+        barras.append(f"<g><title>{detalle}</title><rect class=baj x='{i * ancho}' y='{alto - hb - hs:.2f}' width='{ancho - 2}' "
+                      f"height='{hb:.2f}'/><rect class=sub x='{i * ancho}' y='{alto - hs:.2f}' width='{ancho - 2}' height='{hs:.2f}'/></g>")
+    svg = (f"<svg class=horas viewBox='0 0 {len(serie) * ancho} {alto}' preserveAspectRatio='none' role='img' "
+           f"aria-label='Bytes por intervalo'>{''.join(barras)}</svg>")
+    leyenda = (f"<div class='leyenda mut'>{_t(serie[0].get('inicio'))} → {_t(serie[-1].get('inicio'))} · máximo {_b(maximo)}"
+               "<span style='background:var(--acc)'></span>bajada<span style='background:var(--warn)'></span>subida</div>")
+    tabla = _tabla([("Inicio", False), ("Bajada", True), ("Subida", True), ("Flujos", True), ("Abonados máx./min", True)],
+                   [[_t(s.get("inicio")), _b(s.get("bytes_bajada")), _b(s.get("bytes_subida")), _num(s.get("flujos")),
+                     _num(s.get("abonados_max_ventana"))] for s in serie])
+    return f"{svg}{leyenda}<details><summary>Ver tabla</summary>{tabla}</details>"
+
+
+def _cifra(titulo, valor, clase=""):
+    return f"<div><span class=mut>{titulo}</span><b class='{clase}'>{valor}</b></div>"
+
+
+def _tabla_puertos(filas):
+    return _tabla([("Puerto", False), ("Servicio", False), ("% abonados", True), ("Abonados", True), ("Flujos", True),
+                   ("Subida", True), ("Bajada", True)],
+                  [[_t(f.get("etiqueta")), _t(f.get("servicio")), _num(f.get("pct_abonados")), _num(f.get("abonados")),
+                    _num(f.get("flujos")), _b(f.get("bytes_subida")), _b(f.get("bytes_bajada"))] for f in filas])
+
+
+def _tabla_senal(grupos):
+    """{nombre: [filas]} de senales()['sensibles'|'reflectores']."""
+    filas = [[_t(nombre), _t(x.get("router")), _t(x.get("abonado")), _num(x.get("flujos")), _num(x.get("remotos_max_ventana")),
+              _num(x.get("ventanas")), _t(x.get("ultima"))]
+             for nombre, lista in (grupos or {}).items() for x in lista]
+    return _tabla([("Señal", False), ("Router", False), ("Abonado", False), ("Flujos", True), ("Remotos máx./min", True),
+                   ("Minutos", True), ("Última", False)], filas, "Ninguna.")
+
+
+def _salud(s):
+    exp = s.get("exportadores") or []
+    filas, desconocidos, fuera, perdidas = [], [], [], []
+    for x in exp:
+        pct = x.get("pct_fuera_categoria") or 0
+        clase = ""
+        if x.get("router") is None:
+            clase = "malo"
+            desconocidos.append(x.get("exportador"))
+        elif pct > 30:
+            clase = "ojo"
+            fuera.append(x.get("router"))
+        if (x.get("secuencia_perdida") or 0) > 0:
+            clase = clase or "ojo"
+            perdidas.append(x.get("router") or x.get("exportador"))
+        filas.append((clase, [_t(x.get("exportador")), _t(x.get("router")) if x.get("router") is not None else "desconocido",
+                              _t(x.get("ultimo_archivo")), _num(x.get("archivos")), _num(x.get("flujos")),
+                              _num(x.get("flujos_categoria")), _num(pct), _num(x.get("secuencia_perdida")),
+                              _b(x.get("bytes_subida")), _b(x.get("bytes_bajada")), _num(x.get("errores"))]))
+    tabla = _tabla([("Exportador", False), ("Router", False), ("Último archivo", False), ("Archivos", True), ("Flujos", True),
+                    ("De categoría", True), ("% fuera", True), ("Secuencia perdida", True), ("Subida", True), ("Bajada", True),
+                    ("Errores", True)], filas, "Ningún exportador en las últimas 24 h.")
+    notas = []
+    if desconocidos:
+        notas.append(f"<p class=bad>Exportador desconocido ({e(', '.join(str(d) for d in desconocidos))}): llegan flujos desde una IP "
+                     "que no es la de ningún router del inventario y no se procesan. Anotar esta IP en Routers → «IP desde la que "
+                     "exporta NetFlow» del router que corresponda.</p>")
+    if fuera:
+        notas.append(f"<p class=warn>Más del 30 % de los flujos de {e(', '.join(str(r) for r in fuera))} no son de ninguna categoría: "
+                     "¿la WAN está en <code>interfaces=</code>? ¿faltan rangos en el inventario?</p>")
+    if perdidas:
+        notas.append(f"<p class=warn>Se pierden paquetes de exportación en {e(', '.join(str(r) for r in perdidas))} "
+                     "(secuencia perdida): faltan flujos en esos minutos.</p>")
+    d = s.get("disco") or {}
+    estado = d.get("estado") or "—"
+    cifras = "".join([
+        _cifra("Archivos pendientes", _num(s.get("pendientes"))),
+        _cifra("En error", _num(s.get("en_error")), "bad" if s.get("en_error") else ""),
+        _cifra("Descartados (disco)", _num(s.get("descartados")), "bad" if s.get("descartados") else ""),
+        _cifra("Última ejecución", _t(s.get("ultima_ejecucion"))),
+        _cifra("Disco libre", f"{_b(d.get('libre_bytes'))} ({_num(d.get('libre_pct'))} %)",
+               {"ok": "ok", "aviso": "warn", "critico": "bad"}.get(estado, "")),
+        _cifra("Crudo nfcapd", _b(d.get("crudo_bytes"))), _cifra("Base", _b(d.get("db_bytes"))),
+        _cifra("Estado del disco", _t(estado), {"ok": "ok", "aviso": "warn", "critico": "bad"}.get(estado, "")),
+    ])
+    return f"<div class=cifras>{cifras}</div>{tabla}{''.join(notas)}"
+
+
+def vista_trafico(q):
+    """Página Tráfico: lo que dicen los flujos NetFlow de una categoría, por router y periodo."""
+    F, con = _abrir_flujos()
+    if con is None:
+        return pagina("Tráfico", "<h1>Tráfico (NetFlow)</h1>" + SIN_NETFLOW, "/trafico")
+    inv = _inventario()
+    try:
+        routers = sorted(set(inv.get("routers", {})) | set(F.routers_con_datos(con)))
+        categorias = sorted(set(F.categorias_con_datos(con))
+                            | {c for r in inv.get("routers", {}).values() for c in r.get("categorias", {})})
+        periodos = tuple(getattr(F, "PERIODOS", ("hoy", "ayer", "7d", "30d")))
+        router, categoria, periodo, avisos = _filtros(q, routers, categorias, periodos, "hoy")
+        orden_d = q.get("orden_destinos") if q.get("orden_destinos") in _ORDEN_DESTINOS else "bytes"
+        orden_c = q.get("orden_consumo") if q.get("orden_consumo") in _ORDEN_CONSUMO else "bajada"
+        rt = router or None
+        r = F.resumen(con, categoria, rt, periodo)
+        serie = F.por_hora(con, categoria, rt, periodo)
+        destinos = F.top_destinos(con, categoria, rt, periodo, orden=orden_d, limite=50)
+        salientes = F.top_puertos(con, categoria, rt, periodo, sentido="saliente", orden="abonados", limite=80)
+        entrantes = F.top_puertos(con, categoria, rt, periodo, sentido="entrante", orden="abonados", limite=80)
+        exactos = F.top_puertos_exactos(con, categoria, rt, periodo, limite=100)
+        consumo = F.top_consumidores(con, categoria, rt, periodo, orden=orden_c, limite=50)
+        perc = F.percentiles_abonado(con, categoria, rt, periodo)
+        sen = F.senales(con, categoria, rt, periodo, limite=20)
+        salud = F.salud(con, Path(CFG["datos"]), 24)
+        ventanas = F.ventanas_router(con, router, 60) if router else []
+        interfaces = F.interfaces_router(con, router, periodo) if router else []
+    except (sqlite3.Error, ValueError, OSError) as err:
+        return pagina("Tráfico", f"<h1>Tráfico (NetFlow)</h1><div class=card><p class=bad>No se pudo leer la base NetFlow: "
+                      f"{e(str(err))}</p></div>", "/trafico")
+    finally:
+        con.close()
+
+    filtros = (f"<form method=get action='/trafico' class=filtros>"
+               f"<label>Router{_selector('router', routers, router, 'Todos')}</label>"
+               f"<label>Categoría{_selector('categoria', categorias or [categoria], categoria)}</label>"
+               f"<label>Periodo{_selector('periodo', periodos, periodo)}</label>"
+               f"<label>Destinos por{_selector('orden_destinos', _ORDEN_DESTINOS, orden_d)}</label>"
+               f"<label>Consumo por{_selector('orden_consumo', _ORDEN_CONSUMO, orden_c)}</label>"
+               f"<button>Ver</button></form>"
+               f"<p class=mut><a href='/firewall?{e(urlencode({'router': router, 'categoria': categoria}))}'>"
+               "Firewall de esta categoría →</a></p>")
+
+    desconocidos = [x for x in salud.get("exportadores") or [] if x.get("router") is None]
+    relacion = r.get("relacion_bajada_subida")
+    modo = " (máximo diario)" if r.get("abonados_modo") == "max_diario" else ""
+    resumen = "".join([
+        _cifra("Abonados activos" + modo, _num(r.get("abonados_activos"))),
+        _cifra("Flujos", _num(r.get("flujos"))),
+        _cifra("Subida", _b(r.get("bytes_subida"))), _cifra("Bajada", _b(r.get("bytes_bajada"))),
+        _cifra("Bajada / subida", _num(relacion), "warn" if relacion is None or relacion < 0.5 else ""),
+        _cifra("Días con datos", _num(r.get("dias_con_datos"))),
+        _cifra("Última ventana", _t(r.get("ultima_ventana"))),
+        _cifra("Archivos pendientes", _num(r.get("pendientes"))),
+        _cifra("Exportadores desconocidos", _num(len(desconocidos)), "bad" if desconocidos else ""),
+    ])
+    notas = []
+    if relacion is None or relacion < 0.5:
+        notas.append("<p class=warn>No llega la bajada: Traffic Flow solo exporta lo que entra por las interfaces listadas "
+                     "(ver <a href='/doc#netflow-sentido'>Documentación → subida y bajada</a>). Las conexiones se ven todas; "
+                     "los bytes de bajada no.</p>")
+    if modo:
+        notas.append("<p class=mut>En 30 días los abonados distintos son el máximo diario, no un conteo exacto.</p>")
+    if desconocidos:
+        notas.append("<p class=bad>Hay exportadores desconocidos: ver Salud.</p>")
+    sin_datos = "" if r.get("ultima_ventana") else SIN_NETFLOW
+
+    dest = _tabla([("ASN", True), ("Nombre", False), ("País", False), ("Abonados", True), ("% abonados", True),
+                   ("Flujos", True), ("Subida", True), ("Bajada", True), ("Total", True)],
+                  [[_t(d.get("asn")), _t(d.get("nombre")), _t(d.get("pais")), _num(d.get("abonados")),
+                    _num(d.get("pct_abonados")), _num(d.get("flujos")), _b(d.get("bytes_subida")), _b(d.get("bytes_bajada")),
+                    _b(d.get("bytes"))] for d in destinos])
+    sin_cat = _tabla([("Sentido", False), ("Proto", False), ("Puerto", True), ("Servicio", False), ("Flujos", True),
+                      ("Bytes", True), ("Abonados máx./min", True)],
+                     [[_t(x.get("sentido")), _t(x.get("proto")), _t(x.get("puerto")), _t(x.get("servicio")),
+                       _num(x.get("flujos")), _b(x.get("bytes")), _num(x.get("abonados_max_ventana"))] for x in exactos])
+    cons = _tabla([("Router", False), ("Abonado", False), ("Bajada", True), ("Subida", True), ("Flujos", True),
+                   ("Días activo", True), ("Máx. flujos/min", True), ("Máx. IP/min", True), ("Máx. pares UDP/min", True)],
+                  [[_t(x.get("router")), _t(x.get("abonado")), _b(x.get("bytes_bajada")), _b(x.get("bytes_subida")),
+                    _num(x.get("flujos")), _num(x.get("dias_activo")), _num(x.get("max_flujos")), _num(x.get("max_ips")),
+                    _num(x.get("max_peers_udp"))] for x in consumo])
+    pct = _tabla([("Métrica (por abonado y MINUTO)", False)] + [(c, True) for c in ("p50", "p90", "p99", "p99.9", "máx", "n")],
+                 [[t] + [_num(perc[k].get(c)) for c in ("p50", "p90", "p99", "p99.9", "max", "n")]
+                  for k, t in _PERCENTILES if k in perc], "Sin observaciones en el periodo.")
+    barridos = _tabla([("Router", False), ("Abonado", False), ("Puerto", False), ("Servicio", False),
+                       ("Remotos máx./min", True), ("Minutos", True), ("Última", False)],
+                      [[_t(x.get("router")), _t(x.get("abonado")), _t(x.get("puerto")), _t(x.get("servicio")),
+                        _num(x.get("remotos_max_ventana")), _num(x.get("ventanas")), _t(x.get("ultima"))]
+                       for x in sen.get("barridos") or []], "Ninguno.")
+    p2p = _tabla([("Router", False), ("Abonado", False), ("Pares UDP máx./min", True), ("Minutos", True), ("Última", False)],
+                 [[_t(x.get("router")), _t(x.get("abonado")), _num(x.get("peers_udp_max")), _num(x.get("ventanas")),
+                   _t(x.get("ultima"))] for x in sen.get("p2p") or []], "Ninguno.")
+    dns = _tabla([("Proto/puerto", False), ("Servidor", False), ("Red", False), ("Abonados", True), ("% abonados", True),
+                  ("Flujos", True)],
+                 [[_t(x.get("proto")) + "/" + _t(x.get("puerto")), _t(x.get("servidor")), _t(x.get("red")),
+                   _num(x.get("abonados")), _num(x.get("pct_abonados")), _num(x.get("flujos"))] for x in sen.get("dns") or []],
+                 "Nada.")
+    no_pub = _tabla([("Red /24", False), ("Abonados", True), ("Flujos", True), ("Bytes", True)],
+                    [[_t(x.get("red")), _num(x.get("abonados")), _num(x.get("flujos")), _b(x.get("bytes"))]
+                     for x in sen.get("destinos_no_publicos") or []], "Nada.")
+    if router:
+        vent = _tabla([("Minuto", False), ("Flujos total", True), ("De categoría", True), ("Subida", True), ("Bajada", True),
+                       ("Secuencia perdida", True), ("Estado", False)],
+                      [("malo" if x.get("estado") not in ("ok", "vacio") else "",
+                        [_t(x.get("ventana")), _num(x.get("flujos_total")), _num(x.get("flujos_categoria")),
+                         _b(x.get("bytes_subida")), _b(x.get("bytes_bajada")), _num(x.get("secuencia_perdida")),
+                         _t(x.get("estado"))]) for x in ventanas], "Sin archivos en la última hora.")
+        vent = f"""<h3>Minuto a minuto (última hora) de {e(router)}</h3>
+<p class=mut>Para medir la cobertura: anotar en el router <code>/interface print stats</code> de la interfaz de clientes al inicio y al final
+de unos minutos y comparar <code>rx-byte</code> (lo que suben los abonados) con la suma de <b>Subida</b> de esos minutos, y <code>tx-byte</code>
+con <b>Bajada</b>. Subida ≈ rx y bajada ≈ 0: Traffic Flow solo exporta lo que entra por la interfaz. Las dos muy por debajo: FastTrack o
+hw-offload no se están exportando.</p>{vent}"""
+        intf = _tabla([("ifIndex entrada", True), ("ifIndex salida", True), ("Flujos", True), ("Bytes", True)],
+                      [[_t(x.get("entrada")), _t(x.get("salida")), _num(x.get("flujos")), _b(x.get("bytes"))]
+                       for x in interfaces])
+        intf = ("<p class=mut>ifIndex (número SNMP de la interfaz en el router) por donde entra y sale el tráfico de abonados. "
+                "Si aparece una interfaz que no es la de clientes, revisar <code>interfaces=</code> de Traffic Flow.</p>" + intf)
+    else:
+        vent = "<p class=mut>Elegir un router para ver su minuto a minuto de la última hora.</p>"
+        intf = "<p class=mut>Elegir un router para ver sus interfaces.</p>"
+
+    periodo_txt = f"{e(categoria)} · {e(', '.join(str(x) for x in r.get('routers') or []) or 'todos los routers')} · " \
+                  f"{_t(r.get('desde'))} a {_t(r.get('hasta'))} ({e(periodo)})"
+    cuerpo = f"""<h1>Tráfico (NetFlow)</h1>
+<div class=card>{filtros}</div>{sin_datos}
+<div class=card><h2>Resumen</h2><p class=mut>{periodo_txt}</p><div class=cifras>{resumen}</div>{''.join(notas)}</div>
+<div class=card><h2>Por {'día' if periodo == '30d' else 'hora'}</h2>{_grafico_horas(serie)}</div>
+<div class=card><h2>Top destinos (ASN) por {e(orden_d)}</h2><p class=mut>Un ASN no es un servicio: Google, Meta, Akamai o Cloudflare
+sirven cientos de servicios desde el mismo ASN. 0 = sin ASN / no público; -1 = otros agrupados.</p>{dest}</div>
+<div class=card><h2>Puertos salientes (servicios que usan los abonados)</h2><p class=mut>Ordenado por % de abonados. Los puertos altos
+sin catálogo van agrupados (1024-49151 y 49152-65535).</p>{_tabla_puertos(salientes)}</div>
+<div class=card><h2>Puertos entrantes (servicios que exponen los abonados)</h2>{_tabla_puertos(entrantes)}</div>
+<div class=card><h2>Puertos altos sin catálogo (exactos)</h2><p class=mut>Lo que el catálogo no nombra, por flujos.</p>{sin_cat}</div>
+<div class=card><h2>Top consumidores por {e(orden_c)}</h2>{cons}</div>
+<div class=card><h2>Por abonado y minuto (base para límites)</h2><p class=mut>Unidad: <b>por abonado y por minuto</b>, no por foto
+como en el informe de conntrack. Un límite <code>dst-limit</code> se fija por encima del p99.9 con margen (×2), nunca en la mediana.</p>{pct}</div>
+<div class=card><h2>Señales a revisar</h2><h3>Puertos sensibles (salientes)</h3>{_tabla_senal(sen.get('sensibles'))}
+<h3>Posibles reflectores (UDP entrante)</h3>{_tabla_senal(sen.get('reflectores'))}
+<h3>Barridos (≥ 50 destinos al mismo puerto en un minuto)</h3>{barridos}<h3>Posible P2P (≥ 100 pares UDP en un minuto)</h3>{p2p}</div>
+<div class=card><h2>DNS: a qué resolvers preguntan</h2>{dns}</div>
+<div class=card><h2>Destinos no públicos</h2><p class=mut>Redes privadas o reservadas fuera de la categoría: servicios internos del ISP,
+rutas mal puestas o fugas.</p>{no_pub}</div>
+<div class=card><h2>Salud del colector (últimas 24 h)</h2>{_salud(salud)}{vent}</div>
+<div class=card><h2>Interfaces del router</h2>{intf}</div>"""
+    return pagina("Tráfico", cuerpo, "/trafico", aviso=" ".join(avisos) or None)
+
+
+def _datos_firewall(q):
+    """Clasificación de la categoría para /firewall y la descarga. None si no hay base NetFlow."""
+    F, con = _abrir_flujos()
+    if con is None:
+        return None
+    inv = _inventario()
+    try:
+        routers = sorted(set(inv.get("routers", {})) | set(F.routers_con_datos(con)))
+        categorias = sorted(set(F.categorias_con_datos(con))
+                            | {c for r in inv.get("routers", {}).values() for c in r.get("categorias", {})})
+        router, categoria, _, avisos = _filtros(q, routers, categorias)
+        try:
+            dias = int(q.get("dias") or 7)
+            if not 1 <= dias <= 14:
+                raise ValueError
+        except ValueError:
+            avisos.append(f"Días «{str(q.get('dias'))[:20]}» no válido (1 a 14): se usan 7.")
+            dias = 7
+        serv = F.servicios_categoria(con, categoria, router or None, dias)
+        perc = F.percentiles_abonado(con, categoria, router or None, "7d")
+    finally:
+        con.close()
+    return {"routers": routers, "categorias": categorias, "router": router, "categoria": categoria, "dias": dias,
+            "avisos": avisos, "clasificacion": firewall.clasificar(serv, perc), "percentiles": perc}
+
+
+def propuesta_firewall(q):
+    """(nombre de archivo, texto .rsc) o None si no hay base NetFlow."""
+    d = _datos_firewall(q)
+    if d is None:
+        return None
+    texto = firewall.propuesta_rsc(d["clasificacion"], d["percentiles"], fecha=date.today().isoformat())
+    return f"firewall-{d['categoria']}.rsc", texto
+
+
+_TITULOS_CLASE = {"riesgo": "Riesgo", "esencial": "Esencial (no se bloquea)", "usado": "Usado", "minoritario": "Minoritario",
+                  "no_observado": "No observado en el periodo"}
+
+
+def vista_firewall(q):
+    try:
+        d = _datos_firewall(q)
+    except (sqlite3.Error, ValueError, OSError) as err:
+        return pagina("Firewall", f"<h1>Firewall por categoría</h1><div class=card><p class=bad>No se pudo leer la base NetFlow: "
+                      f"{e(str(err))}</p></div>", "/firewall")
+    if d is None:
+        return pagina("Firewall", "<h1>Firewall por categoría</h1>" + SIN_NETFLOW, "/firewall")
+    cl = d["clasificacion"]
+    params = {"router": d["router"], "categoria": d["categoria"], "dias": d["dias"]}
+    filtros = (f"<form method=get action='/firewall' class=filtros>"
+               f"<label>Router{_selector('router', d['routers'], d['router'], 'Todos')}</label>"
+               f"<label>Categoría{_selector('categoria', d['categorias'] or [d['categoria']], d['categoria'])}</label>"
+               f"<label>Días (1-14)<input name=dias type=number min=1 max=14 value='{d['dias']}'></label>"
+               "<button>Ver</button></form>")
+    conteo = cl.get("conteo", {})
+    cifras = "".join(_cifra(_TITULOS_CLASE[c], _num(conteo.get(c, 0)), "bad" if c == "riesgo" and conteo.get(c) else "")
+                     for c in firewall.CLASES)
+    if cl.get("suficiente"):
+        estado = (f"<p class=ok>Evidencia suficiente: {_num(cl.get('dias_con_datos'))} días y {_num(cl.get('abonados_total'))} "
+                  "abonados activos.</p>")
+    else:
+        estado = (f"<p class=warn>Evidencia insuficiente: {_t(cl.get('motivo_insuficiente'))}. La propuesta se puede descargar para "
+                  "revisarla, pero su cabecera lo advierte: no aplicar sin más datos.</p>")
+    tablas = []
+    for c in firewall.CLASES:
+        filas = [f for f in cl.get("filas", []) if f.get("clase") == c]
+        if not filas:
+            continue
+        tabla = _tabla([("Sentido", False), ("Proto/puerto", False), ("Servicio", False), ("% abonados", True), ("Abonados", True),
+                        ("Flujos", True), ("Bytes", True), ("Días observado", True), ("Motivo", False)],
+                       [("ojo" if f.get("revisar") else "",
+                         [_t(f.get("sentido")), _t(f.get("etiqueta")), _t(f.get("servicio")), _num(f.get("pct_decision")),
+                          _num(f.get("abonados")), _num(f.get("flujos")), _b(f.get("bytes")), _num(f.get("dias_observado")),
+                          _t(f.get("motivo")) + (" <b>revisar</b>" if f.get("revisar") else "")]) for f in filas])
+        abierto = " open" if c in ("riesgo", "esencial") else ""
+        tablas.append(f"<details{abierto}><summary>{_TITULOS_CLASE[c]} ({len(filas)})</summary>{tabla}</details>")
+    texto = firewall.propuesta_rsc(cl, d["percentiles"], fecha=date.today().isoformat())
+    descarga = f"/firewall/propuesta.rsc?{e(urlencode(params))}"
+    cuerpo = f"""<h1>Firewall por categoría</h1>
+<div class=card>{filtros}</div>
+<div class=card><h2>Evidencia</h2><p class=mut>{e(d['categoria'])} · {e(', '.join(str(x) for x in cl.get('routers') or []) or 'todos los routers')} ·
+{_t(cl.get('desde'))} a {_t(cl.get('hasta'))} · abonados distintos exactos del periodo.</p>{estado}<div class=cifras>{cifras}</div></div>
+<div class=card><h2>Cómo se clasifica</h2><ul>
+<li><b>Riesgo</b>: puerto de la lista de riesgo del sentido (SMTP 25, Telnet, SMB/NetBIOS/RPC, C2 Mēris salientes; reflectores UDP y
+servicios de administración entrantes). Si lo usa ≥ {firewall.PCT_ESENCIAL:g} % de los abonados se marca <b>revisar</b>: masivo, decidir a mano.</li>
+<li><b>Esencial</b>: de la lista «nunca bloquear» (web, QUIC, DNS, NTP, STUN, VPN de trabajo, correo de clientes, DNS cifrado = decisión de
+política DNS) o usado por ≥ {firewall.PCT_ESENCIAL:g} % de los abonados.</li>
+<li><b>Usado</b>: entre {firewall.PCT_USADO:g} % y {firewall.PCT_ESENCIAL:g} %. <b>Minoritario</b>: menos de {firewall.PCT_USADO:g} %.</li>
+<li><b>No observado</b>: riesgo conocido o puerto del catálogo sin tráfico en el periodo.</li>
+<li>Evidencia mínima: {firewall.MIN_DIAS} días con datos y {firewall.MIN_ABONADOS} abonados activos.</li></ul></div>
+<div class=card><h2>Clasificación</h2>{''.join(tablas) or '<p class=mut>Sin servicios en el periodo.</p>'}</div>
+<div class=card><h2>Propuesta (modo detección)</h2><p>Cada bloqueo nace como detección (address-list <code>DET-…</code>) con el drop gemelo
+<code>disabled=yes</code>, solo para conexiones nuevas, sin IPs: la lista de la categoría la completa el operador. Despliegue: respaldo →
+Safe Mode → un core canario → revisar contadores 7 días → activar drops → flota. Nada se aplica desde aquí.</p>
+<p><a class=btn href="{descarga}">Descargar propuesta</a></p>
+<details><summary>Ver propuesta</summary>{_copiable("fw-rsc", texto)}</details></div>"""
+    return pagina("Firewall", cuerpo, "/firewall", aviso=" ".join(d["avisos"]) or None)
+
+
 def vista_texto(titulo, ruta, activa, refresco=None):
     return pagina(titulo, f"<h1>{e(ruta.name)}</h1><div class=card><pre>{e(ruta.read_text(encoding='utf-8', errors='replace'))}</pre></div>",
                   activa, refresco=refresco)
@@ -468,13 +1007,85 @@ def vista_texto(titulo, ruta, activa, refresco=None):
 
 DOC = """<h1>Documentación</h1>
 <div class=card><h2>Qué hace</h2>
-<p>Toma fotos de la tabla de <i>connection tracking</i> de los cores MikroTik, filtradas por el rango de cada categoría de abonado
-(residencial, empresarial…), y arma un perfil: qué puertos y protocolos usan, hacia qué destinos (ASN), en qué sentido y cuántas
-conexiones abre cada abonado. Con ese perfil se diseña el firewall de la categoría en la cadena <code>forward</code> del core.</p></div>
+<p>Registra <b>todas</b> las conexiones de los abonados a partir de <b>NetFlow v9</b> (Traffic Flow) que envían los cores MikroTik, las
+agrupa por router, categoría de abonado (residencial, empresarial…), sentido, servicio, destino (ASN) y abonado, y con eso clasifica cada
+protocolo/puerto de la categoría y genera una propuesta de firewall para la cadena <code>forward</code> del core, en modo detección.</p>
+<p>Las fotos de la tabla de <i>connection tracking</i> (conntrack) siguen funcionando y complementan: NetFlow da la <b>tasa</b> y la
+cobertura completa (conexiones nuevas por minuto, % de abonados, destinos, consumo) → base de <code>dst-limit</code>; conntrack da la
+<b>concurrencia</b> (conexiones abiertas a la vez) → base de <code>connection-limit</code>.</p></div>
 <div class=card><h2>Seguridad sobre los routers</h2><ul>
 <li>Solo se ejecutan órdenes <code>print</code>. El código rechaza cualquier otra antes de abrir SSH, y el usuario del router es del grupo <code>read</code>.</li>
 <li>Antes de descargar se cuenta (<b>Contar</b>). Si un rango supera el máximo del inventario (150 000 conexiones por defecto) la muestra se omite: hay que partir el CIDR.</li>
-<li>No se activa Traffic Flow, ni torch, ni se cambia ninguna regla. La propuesta de firewall es un archivo para revisión humana.</li></ul></div>
+<li>Este sistema no cambia nada en el router: Traffic Flow lo configura el operador con los comandos de <b>Panel → Exportar NetFlow</b>,
+y la propuesta de firewall es un archivo <code>.rsc</code> para revisión humana.</li></ul></div>
+<div class=card id="netflow"><h2>NetFlow: cómo se configura el router</h2><ol>
+<li><b>Mirar antes</b> (<code>/ip traffic-flow print</code> y <code>target print</code>): si ya dice <code>enabled: yes</code>, el router
+exporta a otro colector. <code>interfaces=</code> es <b>global</b>: cambiarlo cambia lo que recibe el otro sistema. Los comandos del panel lo
+comprueban solos: en ese caso no tocan <code>interfaces=</code> y solo agregan el destino, salvo que sea <code>interfaces=all</code>
+(el defecto, incluye la WAN): entonces no agregan nada y hay que acordar con el dueño del otro colector pasar a la interfaz de
+clientes.</li>
+<li><code>interfaces=</code> = la interfaz de clientes (si la VLAN va sobre un bridge, el bridge). Varias, separadas por coma; nombres con
+espacios, toda la lista entre comillas. <b>Nunca la WAN</b>: multiplica el volumen y no aporta.</li>
+<li><code>cache-entries=128k</code> (4k por defecto se llena en un core y parte los flujos; en equipos chicos 64k o 32k),
+<code>active-flow-timeout=1m</code> (una conexión larga se reporta cada minuto, sus bytes caen en su minuto real).</li>
+<li>Destino: este servidor, UDP 2055, versión 9, <code>src-address</code> = IP del router con la que este servidor lo ve,
+<code>v9-template-timeout=1m</code>. Sin plantilla v9 el colector no decodifica nada: con poco tráfico puede tardar varios minutos.</li>
+<li><b>Quitar</b> borra solo el destino hacia este servidor y apaga Traffic Flow únicamente si no queda otro colector.</li></ol>
+<p>Servicios en el servidor: <code>mtp-colector</code> (nfcapd en UDP 2055, un archivo por router y minuto) y <code>mtp-flujos.timer</code>
+(cada minuto procesa los archivos cerrados y los agrega en <code>data/flujos.db</code>).</p></div>
+<div class=card><h2>Exportador desconocido</h2>
+<p>El colector reconoce a cada router por la IP de origen del envío. Si llega desde una IP que no es la de ningún router (el envío sale por
+NAT o VPN con otra IP), no se procesa y aparece en rojo en <b>Tráfico → Salud</b>: anotar esa IP en Routers → «IP desde la que exporta
+NetFlow». Por eso dos routers no pueden tener la misma IP de exportación.</p></div>
+<div class=card id="netflow-sentido"><h2>Subida, bajada y el caso «solo entrada»</h2>
+<p>Subida = bytes que envía el abonado; bajada = bytes que recibe. La documentación de MikroTik no dice si Traffic Flow exporta lo que
+entra, lo que sale o ambos por las interfaces listadas, y hay reportes de que solo exporta lo que <b>entra</b>. En ese caso, con la interfaz
+de clientes se ven <b>todas las conexiones</b> que abre o contesta el abonado (alcanza para el firewall de salida), pero no la bajada: el
+resumen lo avisa cuando la relación bajada/subida es menor que 0,5 o no hay subida. Para medirlo: comparar <code>/interface print stats</code>
+de la interfaz de clientes con el minuto a minuto de Tráfico → Salud (elegir el router).</p></div>
+<div class=card><h2>FastTrack y hw-offload</h2>
+<p>El tráfico acelerado por hardware (FastTrack con <code>hw-offload=yes</code>, L3 HW offload del switch, bridge con <code>hw=yes</code>)
+<b>no se exporta</b>. FastTrack por software está en duda (la documentación se contradice): si subida y bajada salen muy por debajo de los
+contadores de la interfaz, es eso.</p></div>
+<div class=card><h2>Página Tráfico: qué significa cada tabla</h2><ul>
+<li><b>Abonado activo</b> = IP de la categoría con algún flujo en el periodo. En rangos públicos (empresarial) una IP que solo recibe
+escaneos entrantes también cuenta: sube el total y baja los % de abonados (ver Página Firewall).</li>
+<li><b>Filtros</b>: router (o todos: la misma IP en dos routers son dos abonados), categoría y periodo: <code>hoy</code>, <code>ayer</code>,
+<code>7d</code> (los 7 días completos que terminan ayer) y <code>30d</code>.</li>
+<li><b>Resumen</b>: abonados activos (exactos; en 30 días, máximo diario), flujos, subida, bajada, última ventana procesada, archivos
+pendientes y exportadores desconocidos.</li>
+<li><b>Por hora</b> (por día en 30 días): bajada y subida apiladas; el detalle de cada barra al pasar el ratón y en «Ver tabla».</li>
+<li><b>Top destinos (ASN)</b>: por bytes o por abonados. Un ASN no es un servicio (las CDN sirven cientos desde el mismo ASN).</li>
+<li><b>Puertos salientes y entrantes</b>: servicio, % de abonados que lo usaron, flujos y bytes. Los puertos altos sin catálogo se agrupan en
+1024-49151 y 49152-65535; la tabla <b>sin catálogo</b> muestra los exactos más usados.</li>
+<li><b>Top consumidores</b>: abonados por bajada, subida, total o flujos, con sus máximos por minuto.</li>
+<li><b>Por abonado y minuto</b>: percentiles de conexiones nuevas, IP y puertos remotos, pares UDP, SYN sin respuesta. Unidad: <b>por
+minuto</b> (no por foto como en conntrack). Error ≤ 10 %, siempre hacia arriba.</li>
+<li><b>Señales</b>: puertos sensibles salientes (SMTP 25, Telnet, SMB…), posibles reflectores (UDP entrante a 53/123/1900…), barridos
+(≥ 50 destinos al mismo puerto en un minuto) y P2P (≥ 100 pares UDP en un minuto). <b>DNS</b>: a qué resolvers preguntan.
+<b>No públicos</b>: redes privadas fuera de la categoría.</li>
+<li><b>Salud</b>: por exportador, archivos, flujos, % fuera de categoría (más de 30 %: ¿la WAN en <code>interfaces=</code>? ¿faltan
+rangos?), secuencia perdida (se pierden paquetes del envío), errores, disco. <b>Interfaces</b>: ifIndex por donde pasa el tráfico.</li></ul></div>
+<div class=card><h2>Retención</h2><ul>
+<li>Crudo de nfcapd: 6 horas o 6 GB, lo que llegue antes (un guardián de disco borra antes si el disco se llena).</li>
+<li>Presencia por abonado (para contar abonados distintos exactos): 8 a 14 días. Consumo por abonado y puertos exactos: 90 días.</li>
+<li>Agregados diarios por servicio, destino e histogramas: 180 a 400 días.</li></ul></div>
+<div class=card><h2>Página Firewall</h2>
+<p>Clasifica cada proto/puerto de la categoría con el % de abonados distintos del periodo (1 a 14 días; 7 por defecto):</p><ul>
+<li><b>Riesgo</b>: lista de riesgo del sentido (salientes: SMTP 25, Telnet 23/2323, RPC 135, NetBIOS 137-139, SMB 445, C2 Mēris
+16464-16471; entrantes: reflectores UDP 53/123/1900/11211/19/389/161/5353 y Telnet, SMB, RDP, VNC, TR-069, Winbox, API). Con ≥ 5 % de
+abonados queda en <b>revisar</b> (masivo: decidir a mano).</li>
+<li><b>Esencial</b>: lista «nunca bloquear» (web, QUIC, DNS y NTP salientes, STUN, IPsec, OpenVPN, WireGuard, PPTP+GRE, correo de clientes,
+DNS cifrado 853 = decisión de política DNS) o ≥ 5 % de los abonados. <b>Usado</b>: 0,5 % a 5 %. <b>Minoritario</b>: menos de 0,5 %.
+<b>No observado</b>: riesgo conocido o puerto del catálogo sin tráfico.</li>
+<li>Evidencia suficiente: 7 días con datos y 50 abonados activos. Si no, la página lo dice y la propuesta lo advierte en la cabecera.</li>
+<li><b>Rangos públicos (empresarial)</b>: una IP del rango que solo <b>recibe</b> tráfico entrante (escaneos de internet) cuenta como
+abonado activo aunque no la use nadie. Eso infla el total de abonados y baja los % de abonados de Tráfico y Firewall: un servicio
+puede quedar como «usado» o «minoritario» siendo esencial para los clientes reales. Con rangos públicos, mirar también la cantidad de
+abonados y no solo el %.</li>
+<li><b>Descargar propuesta</b>: <code>.rsc</code> genérico, sin IPs, en modo detección (address-list <code>DET-RES-…</code>, drop gemelo
+<code>disabled=yes</code>, solo <code>connection-state=new</code>, comentario con la evidencia) y su rollback. Lo mismo por consola:
+<code>python3 -m mtp.firewall --datos /var/lib/mikrotik-traffic-profiler/data --categoria residencial</code>.</li></ul></div>
 <div class=card><h2>Botones</h2><ul>
 <li><b>Descubrir</b>: vuelca pools, direcciones, NAT, filtros, mangle, colas y ajustes de conntrack. Sirve para ubicar el punto de inserción.</li>
 <li><b>Contar</b>: cuántas conexiones tiene ahora cada CIDR de la categoría, sin descargar nada.</li>
@@ -493,7 +1104,9 @@ conexiones abre cada abonado. Con ese perfil se diseña el firewall de la catego
 <li>Pestaña <b>Routers</b> → formulario: nombre, IP y puerto SSH, rangos residenciales y empresariales y, si el router exporta NetFlow
 desde otra IP, esa IP.</li>
 <li>Panel → <b>Probar conexión</b> (debe salir la identidad y la versión del router) → <b>Descubrir</b> y <b>Contar</b>.</li>
-<li>Si todo cuadra, en Routers → <b>Activar muestreo</b>. Desde ahí se muestrea solo en cada franja.</li></ol></div>
+<li>Si todo cuadra, en Routers → <b>Activar muestreo</b>. Desde ahí se muestrea solo en cada franja.</li>
+<li>NetFlow: Panel → <b>Exportar NetFlow</b>, elegir el router y la interfaz de clientes, y pasar los comandos al operador. En menos de
+tres minutos el router debe aparecer en <b>Tráfico → Salud</b> con archivos por minuto.</li></ol></div>
 <div class=card><h2>Cómo leer el informe</h2><ul>
 <li>Pesa el <b>% de abonados</b>, no los bytes: lo que usa mucha gente no se bloquea.</li>
 <li>Lo muy corto (DNS, NTP) sale poco en una foto: su ausencia no prueba que nadie lo use.</li>
@@ -502,11 +1115,14 @@ desde otra IP, esa IP.</li>
 <div class=card><h2>Del perfil al firewall</h2>
 <p>Modelo residencial: <b>lista negra con evidencia</b>, no lista blanca. Capa <code>RES-SALIDA</code>/<code>RES-ENTRADA</code> solo para conexiones nuevas;
 cada bloqueo nace en modo detección (address-list <code>DET-RES-*</code>) con el drop gemelo desactivado, se revisa 7 días y se activa primero en un core canario.
-La propuesta la redacta el agente <code>trafico-mikrotik</code> en <code>propuestas/</code> del repositorio.</p></div>
+La base es la página <b>Firewall</b> (NetFlow); el agente <code>trafico-mikrotik</code> la revisa, le suma el <code>connection-limit</code> de
+conntrack y redacta la lectura en <code>propuestas/</code> del repositorio.</p></div>
 <div class=card><h2>Archivos en el servidor</h2><ul>
 <li>Código: <code>/opt/mikrotik-traffic-profiler</code> (repositorio git; actualizar con <code>git pull</code> y reiniciar <code>mtp-web</code>).</li>
-<li>Configuración: <code>/etc/mikrotik-traffic-profiler/</code> (inventario, web.json con el hash de la clave del panel).</li>
-<li>Datos: <code>/var/lib/mikrotik-traffic-profiler/data/</code> (crudo, descubrimiento, informes, tareas).</li>
+<li>Configuración: <code>/etc/mikrotik-traffic-profiler/</code> (inventario, web.json con el hash de la clave del panel, mtp.env con el puerto
+y los límites de NetFlow).</li>
+<li>Datos: <code>/var/lib/mikrotik-traffic-profiler/data/</code> (crudo, descubrimiento, informes, tareas; <code>nfcapd/</code> = archivos
+NetFlow crudos por exportador; <code>flujos.db</code> = agregados NetFlow).</li>
 <li>Clave del panel: <code>python3 -m mtp.web --config /etc/mikrotik-traffic-profiler/web.json --cambiar-clave</code> como root desde /opt/mikrotik-traffic-profiler.</li></ul></div>
 """
 
@@ -530,10 +1146,10 @@ class Manejador(BaseHTTPRequestHandler):
         c = SimpleCookie(self.headers.get("Cookie", ""))
         return sesion_valida(c["mtp_sesion"].value, CFG["secreto"]) if "mtp_sesion" in c else None
 
-    def _enviar(self, codigo, cuerpo, cabeceras=None):
+    def _enviar(self, codigo, cuerpo, cabeceras=None, tipo="text/html; charset=utf-8"):
         datos = cuerpo.encode("utf-8")
         self.send_response(codigo)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Type", tipo)
         self.send_header("Content-Length", str(len(datos)))
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("X-Content-Type-Options", "nosniff")
@@ -562,7 +1178,21 @@ class Manejador(BaseHTTPRequestHandler):
         if not self._usuario():
             return self._ir("/entrar")
         if url.path == "/":
-            return self._enviar(200, vista_panel(q.get("aviso")))
+            return self._enviar(200, vista_panel(q.get("aviso"), q.get("nf_router"), q.get("nf_interfaz")))
+        if url.path == "/trafico":
+            return self._enviar(200, vista_trafico(q))
+        if url.path == "/firewall":
+            return self._enviar(200, vista_firewall(q))
+        if url.path == "/firewall/propuesta.rsc":
+            try:
+                propuesta = propuesta_firewall(q)
+            except (sqlite3.Error, ValueError, OSError) as err:
+                return self._enviar(500, pagina("Error", f"<h1>No se pudo leer la base NetFlow</h1><p>{e(str(err))}</p>"))
+            if propuesta is None:
+                return self._enviar(404, pagina("Sin datos", "<h1>Firewall por categoría</h1>" + SIN_NETFLOW, "/firewall"))
+            nombre, texto = propuesta
+            return self._enviar(200, texto, {"Content-Disposition": f'attachment; filename="{nombre}"'},
+                                tipo="text/plain; charset=utf-8")
         if url.path == "/muestras":
             return self._enviar(200, vista_muestras())
         if url.path == "/informes":
@@ -639,6 +1269,12 @@ class Manejador(BaseHTTPRequestHandler):
                 anterior = f.get("anterior") or ""
                 if nuevo != anterior and nuevo in inv["routers"]:
                     return f"Ya existe un router llamado «{nuevo}»."
+                # el colector reconoce al router por la IP de origen del envío NetFlow: no puede repetirse
+                ip_nf = router.get("exportador") or router["host"]
+                for otro, r in inv["routers"].items():
+                    if otro not in (nuevo, anterior) and (r.get("exportador") or r.get("host")) == ip_nf:
+                        return (f"La IP de exportación NetFlow {ip_nf} ya es la de «{otro}»: el colector no podría distinguirlos. "
+                                "Si este router envía desde otra IP, anotarla en «IP desde la que exporta NetFlow».")
                 if anterior and anterior != nuevo:
                     inv["routers"].pop(anterior, None)
                 existia = nuevo in inv["routers"] or bool(anterior)

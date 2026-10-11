@@ -1,0 +1,30 @@
+[Unit]
+Description=Procesa los archivos NetFlow cerrados y agrega por categoria (streaming)
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=mtp
+Group=mtp
+WorkingDirectory=/opt/mikrotik-traffic-profiler
+Environment=TZ=America/Guayaquil PYTHONDONTWRITEBYTECODE=1
+EnvironmentFile=/etc/mikrotik-traffic-profiler/mtp.env
+# Refresco de ip2asn: no descarga si tiene menos de 7 dias; si iptoasn no responde, espera 15 s como maximo
+# y no lo reintenta hasta dentro de 1 h. Se queda aqui porque mtp-analizar no corre sin muestras de conntrack.
+ExecStartPre=-/usr/bin/python3 trafico.py --datos /var/lib/mikrotik-traffic-profiler/data asn --timeout 15 --reintento-horas 1
+ExecStart=/usr/bin/python3 trafico.py --inventario /var/lib/mikrotik-traffic-profiler/inventario.json --datos /var/lib/mikrotik-traffic-profiler/data flujos-procesar --max-segundos 600
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+# tope duro: un minuto demasiado grande se aborta (estado error) antes de llegar aqui
+MemoryHigh=600M
+MemoryMax=750M
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/mikrotik-traffic-profiler

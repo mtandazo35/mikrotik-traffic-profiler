@@ -1,6 +1,6 @@
 ---
 name: trafico-mikrotik
-description: Ingeniería de tráfico sobre cores MikroTik de ISP. Recolecta en SOLO LECTURA muestras de connection tracking por categoría de abonado (residencial, empresarial…), arma el perfil (puertos, protocolos, destinos/ASN, sentido, conexiones por abonado) y, con esa evidencia, propone el firewall de la categoría para la cadena forward del core. Úsalo para "qué usan los residenciales", "perfil de tráfico de tal core" o "diseñar firewall residencial/empresarial".
+description: Ingeniería de tráfico sobre cores MikroTik de ISP. Lee los agregados NetFlow v9 (fuente principal: todas las conexiones por categoría de abonado) y, como complemento, muestras de connection tracking en SOLO LECTURA; arma el perfil (puertos, protocolos, destinos/ASN, sentido, tasa y concurrencia por abonado) y, con esa evidencia, propone el firewall de la categoría para la cadena forward del core, en modo detección. Úsalo para "qué usan los residenciales", "perfil de tráfico de tal core" o "diseñar firewall residencial/empresarial".
 tools: Bash, Read, Write, Edit, Grep, Glob
 ---
 
@@ -11,6 +11,20 @@ La recolección programada corre en el servidor del perfilador (`/opt/mikrotik-t
 `mtp-web`). Para analizar allí: `runuser -u mtp -- python3 trafico.py --datos /var/lib/mikrotik-traffic-profiler/data …`
 por SSH. El muestreo automático de un router (casilla en Routers) solo se activa con aprobación del operador.
 
+**Fuentes.** NetFlow es la fuente principal: los cores exportan Traffic Flow v9 a `mtp-colector` (nfcapd, UDP 2055) y
+`mtp-flujos.timer` lo agrega cada minuto en `data/flujos.db` (todas las conexiones, % de abonados exactos, destinos,
+consumo, conexiones nuevas por minuto). Conntrack (fotos por SSH) queda para la **concurrencia**: es lo único que da
+conexiones abiertas a la vez, base de `connection-limit`. NetFlow da la **tasa**, base de `dst-limit`.
+Consultas en el servidor (JSON):
+
+```
+runuser -u mtp -- python3 trafico.py --datos /var/lib/mikrotik-traffic-profiler/data flujos-estado
+runuser -u mtp -- python3 trafico.py --datos /var/lib/mikrotik-traffic-profiler/data flujos-consulta QUE --categoria residencial [--router R] [--periodo 7d]
+#   QUE ∈ resumen, por_hora, top_destinos, top_puertos, top_puertos_exactos, top_consumidores,
+#         percentiles_abonado, senales, servicios_categoria
+runuser -u mtp -- python3 -m mtp.firewall --datos /var/lib/mikrotik-traffic-profiler/data --categoria residencial [--router R] [--dias 7] [--limite-conexiones N]
+```
+
 ## Regla número uno: el router no se toca
 
 - Al router solo llegas con `python trafico.py …` desde la raíz del repo. Ese CLI pasa toda orden por
@@ -18,6 +32,9 @@ por SSH. El muestreo automático de un router (casilla en Routers) solo se activ
 - Nada de `torch`, `sniffer`, `/tool traffic-flow`, `export`, `set`, `add`, `remove`, reset de contadores,
   ni nada que cambie configuración o cargue la CPU. Si algo pide un cambio en el router, **lo propones
   por escrito y te detienes**.
+- **Traffic Flow (`/ip traffic-flow`) solo se propone, nunca se aplica.** Los comandos salen de la tarjeta
+  Panel → Exportar NetFlow (miran antes si ya exporta a otro colector, porque `interfaces=` es global) y los pega el
+  operador. Si un router no aparece en Tráfico → Salud, lo dices y propones la corrección; no la ejecutas.
 - La propuesta de firewall es un archivo `.rsc` para revisión humana. Nunca la aplicas tú.
 - Antes del primer `recolectar` en un router, corre `contar`. Si un CIDR supera `maximo_conexiones_por_cidr`,
   pártelo en trozos más chicos (un /24 o menos). No subas el máximo para "que entre": un `print` enorme en un core
@@ -44,14 +61,22 @@ por SSH. El muestreo automático de un router (casilla en Routers) solo se activ
 4. **Analizar.** `python trafico.py analizar --categoria residencial [--router …] --ip2asn data/ip2asn-v4.tsv.gz`.
    Si no existe el TSV, descárgalo de `https://iptoasn.com/data/ip2asn-v4.tsv.gz` a `data/` (es público y queda local).
    El informe sale en `data/informes/<categoria>-<fecha>.md` y `.json`.
-5. **Interpretar y proponer** (abajo). Entregas un informe y, si hay base suficiente, la propuesta `.rsc`.
+5. **NetFlow.** `flujos-estado` primero: cada router de la categoría debe estar con archivos del último minuto, sin
+   exportadores desconocidos, con poco % fuera de categoría (> 30 % = ¿WAN en `interfaces=`? ¿faltan rangos?) y sin
+   secuencia perdida. Si la relación bajada/subida es < 0,5, Traffic Flow está exportando solo lo que entra: las
+   conexiones valen, los bytes de bajada no. Después `flujos-consulta servicios_categoria` y `percentiles_abonado`
+   (unidad: por abonado y **por minuto**), y `python3 -m mtp.firewall` para la clasificación y la propuesta base.
+6. **Interpretar y proponer** (abajo). Entregas un informe y, si hay base suficiente, la propuesta `.rsc`.
 
 ## Cómo leer el perfil
 
 - **% de abonados** pesa más que conexiones o bytes: un puerto que usa el 30 % de los hogares no se toca, aunque
-  mueva poco. Los bytes son orientativos (FastTrack/hw-offload los congelan).
-- Lo que dura poco (DNS, NTP, STUN) sale subrepresentado en una foto. No concluyas "nadie usa X" por ausencia
-  en pocas muestras.
+  mueva poco. Los bytes son orientativos (FastTrack/hw-offload los congelan; lo acelerado por hardware no se exporta
+  por NetFlow).
+- Con NetFlow el % de abonados de 7 días es **exacto** (abonados distintos); en 30 días es el máximo diario.
+- En las fotos de conntrack lo que dura poco (DNS, NTP, STUN) sale subrepresentado: no concluyas "nadie usa X" por
+  ausencia en pocas muestras. NetFlow sí lo ve; si NetFlow y conntrack discrepan, manda NetFlow salvo en concurrencia.
+- Un ASN no es un servicio (las CDN sirven cientos desde el mismo ASN) y NetFlow no ve dominios.
 - Separa siempre: tráfico **legítimo masivo** (web/QUIC, streaming, push, juegos, videollamadas, VPN de trabajo),
   **legítimo minoritario** (FTP, SSH, puertos raros de cámaras/DVR, juegos de nicho) y **dañino o de riesgo**
   (SMTP 25 directo, SMB/NetBIOS/RPC hacia internet, Telnet/2323, barridos, abonados actuando de reflector UDP).
@@ -61,6 +86,14 @@ por SSH. El muestreo automático de un router (casilla en Routers) solo se activ
   un CPE con UPnP/IoT o simplemente otra población.
 
 ## Cómo diseñar el firewall de una categoría
+
+Punto de partida: la clasificación de `mtp.firewall` (y la página Firewall del panel), con umbrales fijos:
+riesgo = puerto de la lista de riesgo del sentido (con ≥ 5 % de abonados: **revisar**, masivo, decides a mano y lo
+justificas); esencial = lista «nunca bloquear» o ≥ 5 %; usado = 0,5 %–5 %; minoritario = < 0,5 %; no observado =
+riesgo conocido o puerto del catálogo sin tráfico. Evidencia mínima: 7 días con datos y 50 abonados activos; si no
+llega, no hay propuesta (salvo `--forzar`, y lo dices). Tu trabajo es revisarla, no copiarla: añadir
+`connection-limit` desde el p99.9 de conntrack, quitar lo que el descubrimiento muestre que ya está en la base y
+explicar cada bloqueo.
 
 Base existente que **no** dupliques: `C:\Users\Manuel\Documents\GitHub\mikrotik-firewall\firewall-2026-produccion.rsc`
 (RAW, INPUT, anti-spoof, higiene general de forward). Tu capa es **la de la categoría**, en `filter forward`.
@@ -86,8 +119,9 @@ Reglas de diseño:
   address-list=DET-RES-<motivo> address-list-timeout=1d` (o `passthrough` con contador) y `disabled=no`, con el
   `drop` gemelo debajo en `disabled=yes`. Tras ≥7 días con contadores revisados se activa el drop. Lo dices
   explícitamente en la propuesta.
-- Límites por abonado con `connection-limit=N,32` (cuenta por IP de abonado antes del NAT) y `dst-limit` por
-  `src-address`, nunca `limit` global (en hora pico tira a todos). N sale del p99.9 con margen.
+- Límites por abonado con `connection-limit=N,32` (cuenta por IP de abonado antes del NAT; N = 2 × p99.9 de
+  **conntrack**, concurrencia) y `dst-limit` por `src-address` (= 2 × p99.9 de `tcp_nuevas` por minuto de
+  **NetFlow**, tasa), nunca `limit` global (en hora pico tira a todos).
 - Excepción por abonado (`RES-EXCEPCION`) arriba de los bloqueos: el que tenga servidor de correo, cámaras, etc.
 - No bloquees: 443/udp (QUIC), STUN/TURN 3478-3481, 19302-19309, rangos de juegos, 500/4500, 1194, 51820, 1723+GRE,
   465/587/993/995 (correo de clientes), 853 salvo decisión explícita de política DNS.
@@ -103,7 +137,8 @@ Reglas de diseño:
 ## Entregables
 
 1. Informe en `data/informes/` (lo genera el CLI) y tu lectura en un `.md` aparte:
-   `data/informes/<categoria>-<fecha>-lectura.md` con: cobertura (routers, franjas, abonados), qué usan
+   `data/informes/<categoria>-<fecha>-lectura.md` con: cobertura (routers, días NetFlow, salud del colector,
+   franjas de conntrack, abonados), qué usan
    (masivo/minoritario), qué es riesgo y cuántos abonados afecta, anomalías por router, límites sugeridos con su
    percentil de origen y **qué falta medir**.
 2. Si la evidencia alcanza: `propuestas/firewall-<categoria>.rsc` (genérico, sin IPs reales) y, al final de la

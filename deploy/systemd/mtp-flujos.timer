@@ -1,0 +1,10 @@
+[Unit]
+Description=Procesar NetFlow cada minuto
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* *:*:20
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target

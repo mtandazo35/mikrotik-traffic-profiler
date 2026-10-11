@@ -5,7 +5,7 @@ import threading
 import unittest
 from http.server import ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlencode
+from urllib.parse import quote, unquote, urlencode
 
 from mtp import web
 
@@ -36,13 +36,56 @@ class TestCredenciales(unittest.TestCase):
 
     def test_comandos_netflow(self):
         buscar, activar, ver, quitar = web.comandos_netflow("192.0.2.8", 2055)
-        self.assertIn("/ip traffic-flow target add dst-address=192.0.2.8 port=2055 version=9", activar)
-        self.assertIn("interfaces=INTERFAZ-CLIENTES", activar)
-        self.assertIn("enabled=yes", activar)
-        self.assertIn("/ip traffic-flow target remove [find dst-address=192.0.2.8]", quitar)
-        self.assertIn("/ip traffic-flow print", ver)
-        # el script de búsqueda solo lee
+        # paso 0: mirar si ya exporta a otro colector, solo lectura
+        self.assertIn("/ip traffic-flow print", buscar)
+        self.assertIn("/ip traffic-flow target print", buscar)
         self.assertTrue(all(l.startswith("#") or " print" in l for l in buscar.splitlines()))
+        # un solo bloque { … } con llaves y corchetes equilibrados (se pega entero)
+        orden = [l.strip() for l in activar.splitlines() if not l.startswith("#")]
+        self.assertEqual((orden[0], orden[-1]), ("{", "}"))
+        texto = "\n".join(orden)
+        self.assertEqual(texto.count("{"), texto.count("}"))
+        self.assertEqual(texto.count("["), texto.count("]"))
+        self.assertEqual(texto.count('"') % 2, 0)
+        i_enabled = orden.index(":if ([/ip traffic-flow get enabled]) do={")
+        i_else = orden.index("} else={")
+        # el set (interfaces= es global) solo corre en la rama "traffic-flow apagado"
+        i_set = orden.index("/ip traffic-flow set enabled=yes interfaces=INTERFAZ-CLIENTES cache-entries=128k "
+                            "active-flow-timeout=1m inactive-flow-timeout=15s")
+        self.assertGreater(i_set, i_else)
+        self.assertEqual(sum("/ip traffic-flow set" in l for l in orden), 1)
+        # ya activo: mira interfaces=; con "all" (incluye la WAN) apaga la bandera y NO se agrega el destino
+        i_get = orden.index(":local i [:tostr [/ip traffic-flow get interfaces]]")
+        i_all = orden.index(':if (($i = "all") || ([:len $i] = 0)) do={')
+        self.assertTrue(i_enabled < i_get < i_all < orden.index(":set ok false") < i_else)
+        self.assertEqual(orden[1], ":local ok true")
+        destino = [i for i, l in enumerate(orden) if "target add" in l]
+        self.assertEqual(len(destino), 1)
+        self.assertEqual(orden[destino[0]], "/ip traffic-flow target add dst-address=192.0.2.8 port=2055 version=9 "
+                         "src-address=IP_DEL_ROUTER v9-template-refresh=20 v9-template-timeout=1m")
+        self.assertEqual(orden[destino[0] - 1],
+                         ":if ($ok && ([:len [/ip traffic-flow target find dst-address=192.0.2.8]] = 0)) do={")
+        self.assertIn("interfaces=all", activar)
+        self.assertIn("/ip traffic-flow target print detail", ver)
+        self.assertIn("/interface print stats where name=INTERFAZ-CLIENTES", ver)
+        self.assertIn("/ip firewall filter print where action=fasttrack-connection", ver)
+        # quitar: solo nuestro destino; traffic-flow se apaga solo si no queda ningún otro
+        self.assertIn("/ip traffic-flow target remove [find dst-address=192.0.2.8]", quitar)
+        self.assertIn(":if ([:len [/ip traffic-flow target find]] = 0) do={/ip traffic-flow set enabled=no}", quitar)
+        self.assertNotIn("\n/ip traffic-flow set enabled=no", "\n" + quitar)
+
+    def test_comandos_netflow_router_e_interfaces(self):
+        _, activar, ver, _ = web.comandos_netflow("192.0.2.8", 2056, ip_router="192.0.2.1",
+                                                  interfaces="br clientes, vlan20")
+        self.assertIn('interfaces="br clientes,vlan20" cache-entries=128k', activar)
+        self.assertIn("port=2056 version=9 src-address=192.0.2.1 ", activar)
+        self.assertIn('/interface print stats where name="br clientes"', ver)
+        self.assertEqual(web.interfaces_ros("bridge-clientes"), "bridge-clientes")
+        for malo in ['br"; /system reset', "a$b", "x[find]", "a;b", "", None, "a=b"]:
+            self.assertIsNone(web.interfaces_ros(malo), malo)
+        _, activar, _, _ = web.comandos_netflow("192.0.2.8", interfaces='x"; /system reset-configuration')
+        self.assertIn("interfaces=INTERFAZ-CLIENTES", activar)
+        self.assertNotIn("reset", activar)
 
     def test_archivo_seguro(self):
         with tempfile.TemporaryDirectory() as d:
@@ -80,7 +123,8 @@ class TestServidor(unittest.TestCase):
         return r.status, dict(r.getheaders()), r.read().decode()
 
     def test_sin_sesion_redirige(self):
-        for ruta in ["/", "/muestras", "/informes", "/doc", "/tarea?f=x.log"]:
+        for ruta in ["/", "/muestras", "/informes", "/doc", "/tarea?f=x.log", "/trafico", "/firewall",
+                     "/firewall/propuesta.rsc"]:
             st, cab, _ = self._pedir("GET", ruta)
             self.assertEqual((st, cab.get("Location")), (303, "/entrar"), ruta)
         st, cab, _ = self._pedir("POST", "/accion", {"accion": "descubrir", "router": "core-a"})
@@ -138,6 +182,42 @@ class TestServidor(unittest.TestCase):
         self._pedir("POST", "/routers/borrar", {"nombre": "core-c"}, cookie=cookie)
         self.assertNotIn("core-c", inv())
         self.assertIn("core-a", inv())  # el resto intacto
+
+    def test_exportador_duplicado(self):
+        cookie = self._login()
+        inv = lambda: json.loads(Path(web.CFG["inventario"]).read_text(encoding="utf-8"))["routers"]  # noqa: E731
+        form = {"nombre": "core-d", "host": "192.0.2.1", "puerto": "22", "usuario": "trafico",
+                "residencial": "100.64.8.0/24", "empresarial": "", "exportador": "", "anterior": ""}
+        # misma IP que core-a (host, sin exportador): el colector no podría distinguirlos
+        _, cab, _ = self._pedir("POST", "/routers/guardar", form, cookie=cookie)
+        self.assertIn("ya es la de «core-a»", unquote(cab["Location"]))
+        self.assertNotIn("core-d", inv())
+        # host distinto pero exporta desde la IP de core-a
+        _, cab, _ = self._pedir("POST", "/routers/guardar", {**form, "host": "192.0.2.9", "exportador": "192.0.2.1"},
+                                cookie=cookie)
+        self.assertIn("ya es la de «core-a»", unquote(cab["Location"]))
+        # con su propia IP de exportación entra; editarlo después no choca consigo mismo
+        _, cab, _ = self._pedir("POST", "/routers/guardar", {**form, "exportador": "192.0.2.10"}, cookie=cookie)
+        self.assertIn("agregado", unquote(cab["Location"]))
+        _, cab, _ = self._pedir("POST", "/routers/guardar", {**form, "exportador": "192.0.2.10", "anterior": "core-d"},
+                                cookie=cookie)
+        self.assertIn("actualizado", unquote(cab["Location"]))
+        self._pedir("POST", "/routers/borrar", {"nombre": "core-d"}, cookie=cookie)
+        self.assertNotIn("core-d", inv())
+
+    def test_panel_netflow_con_router(self):
+        cookie = self._login()
+        st, _, cuerpo = self._pedir("GET", "/?nf_router=core-a&nf_interfaz=" + quote("br clientes"), cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertIn("src-address=192.0.2.1 ", cuerpo)  # la IP del router en el inventario
+        self.assertIn("interfaces=&quot;br clientes&quot;", cuerpo)
+        self.assertIn("plantilla v9 puede tardar", cuerpo)
+        self.assertIn("<code>interfaces=all</code> (el valor por defecto), <b>no agrega nada</b>", cuerpo)
+        st, _, cuerpo = self._pedir("GET", "/?nf_router=otro&nf_interfaz=" + quote('a"$b<x>'), cookie=cookie)
+        self.assertEqual(st, 200)
+        self.assertIn("src-address=IP_DEL_ROUTER", cuerpo)
+        self.assertIn("Nombre de interfaz no válido", cuerpo)  # modal
+        self.assertNotIn("<x>", cuerpo)
 
     def test_rechaza_otro_origen(self):
         cookie = self._login()
