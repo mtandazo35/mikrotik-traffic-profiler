@@ -23,10 +23,10 @@ bash /opt/mikrotik-traffic-profiler/deploy/install.sh            # --puerto 8080
 ```
 
 Deja: usuario de servicio `mtp`; llave RSA 4096 para los routers (RouterOS 6 no acepta ed25519) en
-`/var/lib/mikrotik-traffic-profiler/.ssh/`; configuración en `/etc/mikrotik-traffic-profiler/` (inventario,
+`/var/lib/mikrotik-traffic-profiler/.ssh/`; configuración en `/etc/mikrotik-traffic-profiler/` (
 `mtp.env`, `web.json` con la clave del panel en PBKDF2); datos en `/var/lib/mikrotik-traffic-profiler/data/`.
-Servicios: `mtp-web` (panel), `mtp-analizar.timer` (23:30) y, por router, `mtp-recolectar@<router>.timer`
-(09:00, 15:00, 20:30 y 21:30 hora de Ecuador; 4 muestras cada 15 min). La clave del panel se muestra una sola vez;
+Servicios: `mtp-web` (panel), `mtp-analizar.timer` (23:30) y `mtp-recolectar.timer` (muestrea los routers con muestreo activo en el panel → Routers;
+09:00, 15:00, 20:30 y 21:30 hora de Ecuador; 4 muestras cada 15 min). La clave del panel se muestra una sola vez;
 se cambia con `python3 -m mtp.web --config /etc/mikrotik-traffic-profiler/web.json --cambiar-clave` (lee de stdin).
 
 El panel muestra routers, muestras, descubrimientos, informes, tareas y timers, lanza las mismas acciones de solo

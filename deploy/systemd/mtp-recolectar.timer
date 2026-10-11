@@ -1,5 +1,5 @@
 [Unit]
-Description=Franjas de muestreo del router %i (manana, tarde y pico nocturno)
+Description=Franjas de muestreo (manana, tarde y pico nocturno)
 
 [Timer]
 OnCalendar=*-*-* 09:00:00 America/Guayaquil

@@ -1,5 +1,5 @@
 [Unit]
-Description=Muestras de conntrack del router %i (solo lectura)
+Description=Muestras de conntrack de los routers con muestreo activo (solo lectura)
 After=network-online.target
 Wants=network-online.target
 
@@ -10,7 +10,7 @@ Group=mtp
 WorkingDirectory=/opt/mikrotik-traffic-profiler
 Environment=TZ=America/Guayaquil PYTHONDONTWRITEBYTECODE=1
 EnvironmentFile=/etc/mikrotik-traffic-profiler/mtp.env
-ExecStart=/usr/bin/python3 trafico.py --inventario /etc/mikrotik-traffic-profiler/inventario.json --datos /var/lib/mikrotik-traffic-profiler/data recolectar --router %i --categoria ${CATEGORIA} --repetir ${REPETIR} --intervalo ${INTERVALO}
+ExecStart=/usr/bin/python3 trafico.py --inventario /var/lib/mikrotik-traffic-profiler/inventario.json --datos /var/lib/mikrotik-traffic-profiler/data recolectar-todos --repetir ${REPETIR} --intervalo ${INTERVALO}
 TimeoutStartSec=2h
 NoNewPrivileges=yes
 ProtectSystem=strict

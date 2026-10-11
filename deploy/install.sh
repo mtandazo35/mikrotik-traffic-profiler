@@ -40,10 +40,14 @@ if [ ! -f "$VAR/.ssh/id_rsa" ]; then
 fi
 
 echo "== configuración"
-if [ ! -f "$ETC/inventario.json" ]; then
-  printf '{\n  "maximo_conexiones_por_cidr": 150000,\n  "routers": {}\n}\n' > "$ETC/inventario.json"
+# El inventario lo edita el panel (usuario mtp, sin acceso de escritura a /etc): vive en $VAR.
+if [ -f "$ETC/inventario.json" ] && [ ! -f "$VAR/inventario.json" ]; then
+  mv "$ETC/inventario.json" "$VAR/inventario.json"
 fi
-chown root:mtp "$ETC/inventario.json"; chmod 0640 "$ETC/inventario.json"
+if [ ! -f "$VAR/inventario.json" ]; then
+  printf '{\n  "maximo_conexiones_por_cidr": 150000,\n  "routers": {}\n}\n' > "$VAR/inventario.json"
+fi
+chown mtp:mtp "$VAR/inventario.json"; chmod 0640 "$VAR/inventario.json"
 
 if [ ! -f "$ETC/mtp.env" ]; then
   printf 'PUERTO_WEB=%s\nCATEGORIA=residencial\nREPETIR=4\nINTERVALO=15\n' "$PUERTO" > "$ETC/mtp.env"
@@ -61,9 +65,12 @@ echo "== tabla IP→ASN"
 runuser -u mtp -- python3 "$APP/trafico.py" --datos "$VAR/data" asn || echo "aviso: no se pudo descargar ip2asn; se reintenta cada noche"
 
 echo "== systemd"
+# versiones anteriores usaban un timer por router (mtp-recolectar@<router>.timer)
+systemctl disable --now 'mtp-recolectar@*.timer' >/dev/null 2>&1 || true
+rm -f '/etc/systemd/system/mtp-recolectar@.service' '/etc/systemd/system/mtp-recolectar@.timer'
 install -m 0644 "$APP"/deploy/systemd/mtp-* /etc/systemd/system/
 systemctl daemon-reload
-systemctl enable --now mtp-web.service mtp-analizar.timer
+systemctl enable --now mtp-web.service mtp-analizar.timer mtp-recolectar.timer
 systemctl restart mtp-web.service
 
 IP="$(hostname -I | awk '{print $1}')"
@@ -75,4 +82,4 @@ fi
 echo "Llave pública para el usuario 'trafico' de cada router:"
 cat "$VAR/.ssh/id_rsa.pub"
 echo
-echo "Al agregar un router al inventario: systemctl enable --now mtp-recolectar@<router>.timer"
+echo "Los routers se agregan en el panel → Routers; el muestreo se activa por router desde ahí."

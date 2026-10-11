@@ -102,6 +102,12 @@ def descubrir(router, nombre, datos):
     return destino
 
 
+def probar(router):
+    """Comprueba el acceso: identidad, versión y si conntrack está activo."""
+    return "\n".join(ejecutar(router, c).strip() for c in
+                     ("/system identity print", "/system resource print", "/ip firewall connection tracking print"))
+
+
 def _filtro(cidr):
     rx = regex_prefijo(cidr)
     return f'where src-address~"{rx}" or dst-address~"{rx}" or reply-src-address~"{rx}"'

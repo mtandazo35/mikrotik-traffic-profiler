@@ -74,6 +74,11 @@ def muestras(datos, categoria, routers=None, desde=None):
                 yield router, m["ts"], m["cidr"], ruta
 
 
+def categorias(datos):
+    """Categorías que tienen muestras guardadas (carpetas crudo/<router>/<categoria>)."""
+    return sorted({m.parent.name for m in Path(datos, "crudo").glob("*/*/muestras.jsonl")})
+
+
 def limpiar(datos, dias):
     """Borra muestras crudas y logs de tareas más viejos que N días. Los informes se conservan."""
     corte = marca_desde(dias)

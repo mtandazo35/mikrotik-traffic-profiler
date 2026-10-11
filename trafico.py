@@ -4,7 +4,9 @@
   python trafico.py descubrir  --router NOMBRE
   python trafico.py contar     --router NOMBRE --categoria residencial
   python trafico.py recolectar --router NOMBRE --categoria residencial [--repetir 4 --intervalo 15]
-  python trafico.py analizar   --categoria residencial [--router A --router B] [--ip2asn data/ip2asn-v4.tsv.gz]
+  python trafico.py recolectar-todos [--repetir 4 --intervalo 15]   # routers con "activo": true, todas sus categorías
+  python trafico.py probar     --router NOMBRE                       # identidad y versión (comprueba el acceso)
+  python trafico.py analizar   [--categoria residencial] [--router A] [--ip2asn data/ip2asn-v4.tsv.gz] [--dias 7]
   python trafico.py limpiar    [--dias 14]    # retención: borra crudo y logs viejos, conserva informes
   python trafico.py asn        [--dias 7]     # descarga/refresca data/ip2asn-v4.tsv.gz (iptoasn.com)
 """
@@ -13,6 +15,7 @@ import json
 import sys
 import time
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from mtp import analizar, router as mk
@@ -53,8 +56,15 @@ def main():
     r.add_argument("--intervalo", type=float, default=15, help="minutos entre repeticiones")
     r.add_argument("--maximo", type=int, help="conexiones máximas por CIDR (por defecto, el del inventario)")
 
-    a = sub.add_parser("analizar", help="perfil de la categoría a partir de las muestras")
-    a.add_argument("--categoria", required=True)
+    t = sub.add_parser("recolectar-todos", help="muestrear todos los routers activos del inventario")
+    t.add_argument("--repetir", type=int, default=1)
+    t.add_argument("--intervalo", type=float, default=15, help="minutos entre repeticiones")
+
+    pr = sub.add_parser("probar", help="comprobar el acceso SSH (identidad y versión)")
+    pr.add_argument("--router", required=True)
+
+    a = sub.add_parser("analizar", help="perfil por categoría a partir de las muestras")
+    a.add_argument("--categoria", help="por defecto, todas las que tengan muestras")
     a.add_argument("--router", action="append")
     a.add_argument("--ip2asn", type=Path, help="TSV de iptoasn.com (ip2asn-v4.tsv.gz)")
     a.add_argument("--dias", type=float, help="solo muestras de los últimos N días (por defecto, todas)")
@@ -92,15 +102,46 @@ def main():
             asn = analizar.Asn(args.ip2asn)
         elif args.ip2asn:
             print(f"aviso: no existe {args.ip2asn}; destinos agrupados por /16", file=sys.stderr)
-        perfil = analizar.analizar(args.datos, args.categoria, args.router, asn, args.dias)
-        if not perfil["resumen"]["muestras"]:
-            sys.exit(f"no hay muestras de {args.categoria!r} en {args.datos / 'crudo'}")
-        print(analizar.guardar(perfil, args.datos))
+        categorias = [args.categoria] if args.categoria else analizar.categorias(args.datos)
+        hechos = 0
+        for categoria in categorias:
+            perfil = analizar.analizar(args.datos, categoria, args.router, asn, args.dias)
+            if perfil["resumen"]["muestras"]:
+                print(analizar.guardar(perfil, args.datos))
+                hechos += 1
+        if not hechos:
+            sys.exit(f"no hay muestras de {', '.join(categorias) or 'ninguna categoría'} en {args.datos / 'crudo'}")
         return
 
     inv = _inventario(args.inventario)
+    if args.orden == "recolectar-todos":
+        maximo = inv.get("maximo_conexiones_por_cidr", 150000)
+        activos = {n: r for n, r in inv["routers"].items() if r.get("activo")}
+        if not activos:
+            print("ningún router con muestreo activo")
+            return
+
+        def un_router(nombre, rt):
+            for categoria in rt.get("categorias", {}):
+                for m in mk.muestrear(rt, nombre, categoria, args.datos, maximo):
+                    print(json.dumps(m, ensure_ascii=False), flush=True)
+
+        fallos = 0
+        for i in range(args.repetir):
+            if i:
+                time.sleep(args.intervalo * 60)
+            with ThreadPoolExecutor(max_workers=8) as pool:
+                trabajos = {pool.submit(un_router, n, r): n for n, r in activos.items()}
+                for t in as_completed(trabajos):
+                    if t.exception():
+                        fallos += 1
+                        print(f"{trabajos[t]}: {t.exception()}", file=sys.stderr, flush=True)
+        sys.exit(1 if fallos else 0)
+
     rt = _router(inv, args.router)
-    if args.orden == "descubrir":
+    if args.orden == "probar":
+        print(mk.probar(rt))
+    elif args.orden == "descubrir":
         print(mk.descubrir(rt, args.router, args.datos))
     elif args.orden == "contar":
         for cidr in rt["categorias"][args.categoria]:

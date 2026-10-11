@@ -22,6 +22,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
+from . import inventario
+
 RAIZ = Path(__file__).resolve().parent.parent
 ITERACIONES = 600_000
 SESION_HORAS = 8
@@ -77,7 +79,7 @@ def archivo_seguro(carpeta, nombre, patron=r"^[\w.-]+$"):
 
 def _inventario():
     try:
-        return json.loads(Path(CFG["inventario"]).read_text(encoding="utf-8"))
+        return inventario.leer(CFG["inventario"])
     except (OSError, ValueError):
         return {"routers": {}}
 
@@ -183,6 +185,8 @@ button,.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:
 button.sec{background:transparent;color:var(--acc);border:1px solid var(--acc)}form.inl{display:inline}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 input{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%;margin:4px 0 10px}
+.rejilla{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 12px}
+label.check{display:flex;gap:8px;align-items:center;margin:4px 0 12px}label.check input{width:auto;margin:0}
 .copiable{position:relative}.copiable button{position:absolute;top:6px;right:6px}.copiable pre{padding-right:80px;white-space:pre-wrap;word-break:break-all}
 dialog{border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);max-width:520px}dialog::backdrop{background:#0008}
 """
@@ -199,7 +203,7 @@ JS = """function copiar(id, b) {
 
 def pagina(titulo, cuerpo, activa="", aviso=None, refresco=None):
     nav = "".join(f'<a href="{u}" class="{"on" if u == activa else ""}">{t}</a>' for u, t in
-                  [("/", "Panel"), ("/muestras", "Muestras"), ("/informes", "Informes"), ("/doc", "Documentación")])
+                  [("/", "Panel"), ("/routers", "Routers"), ("/muestras", "Muestras"), ("/informes", "Informes"), ("/doc", "Documentación")])
     modal = ""
     if aviso:
         modal = (f'<dialog id="aviso"><p>{e(aviso)}</p><form method="dialog"><button>Cerrar</button></form></dialog>'
@@ -228,21 +232,21 @@ def vista_panel(aviso=None):
         ultima = propias[0] if propias else {}
         cats = r.get("categorias", {})
         rangos = "<br>".join(f"{e(c)}: {e(', '.join(v))}" for c, v in cats.items())
-        acciones = _boton("descubrir", "Descubrir", nombre, sec=True)
+        acciones = _boton("probar", "Probar conexión", nombre, sec=True) + _boton("descubrir", "Descubrir", nombre, sec=True)
         for c in cats:
             acciones += _boton("contar", f"Contar {e(c)}", nombre, c, sec=True)
             acciones += _boton("recolectar", f"Muestrear {e(c)}", nombre, c,
                                confirmar=f"Tomar una muestra de conntrack de {c} en {nombre} (solo lectura)?")
         filas.append(
-            f"<tr><td><b>{e(nombre)}</b><div class='mut'>{e(r.get('host', ''))}:{e(str(r.get('puerto', 22)))}</div></td>"
+            f"<tr><td><b>{e(nombre)}</b><div class='mut'>{e(r.get('host', ''))}:{e(str(r.get('puerto', 22)))}</div>"
+            f"{'<span class=ok>muestreo activo</span>' if r.get('activo') else '<span class=warn>muestreo en pausa</span>'}</td>"
             f"<td>{rangos}</td>"
             f"<td class='n'>{len(propias)}</td><td>{e(ultima.get('ts', '—'))}"
             f"{'<div class=warn>' + e(ultima['omitida']) + '</div>' if ultima.get('omitida') else ''}</td>"
             f"<td>{acciones}</td></tr>")
     routers = ("<table><tr><th>Router</th><th>Categorías (CIDR)</th><th class=n>Muestras</th><th>Última</th>"
                "<th>Acciones (solo lectura)</th></tr>" + "".join(filas) + "</table>") if filas else (
-        "<p class='mut'>Aún no hay routers en el inventario. Se agregan en "
-        f"<code>{e(CFG['inventario'])}</code> (ver Documentación).</p>")
+        "<p class='mut'>Aún no hay routers. <a class=btn href='/routers'>Agregar router</a></p>")
     categorias = sorted({c for r in inv.get("routers", {}).values() for c in r.get("categorias", {})}) or ["residencial"]
     analizar = "".join(_boton("analizar", f"Analizar {e(c)}", categoria=c) for c in categorias)
     tareas = []
@@ -282,6 +286,57 @@ servidor con otra IP (NAT o VPN de por medio), cambiar <code>address=</code> por
 def _copiable(ident, texto):
     return (f'<div class=copiable><button class=sec data-id="{ident}" onclick="copiar(this.dataset.id, this)">Copiar</button>'
             f'<pre id="{ident}">{e(texto)}</pre></div>')
+
+
+def _post_router(ruta, nombre, texto, extra="", sec=True, confirmar=None):
+    js = f' onsubmit="return confirm({e(json.dumps(confirmar))})"' if confirmar else ""
+    return (f'<form class="inl" method="post" action="{ruta}"{js}><input type="hidden" name="nombre" value="{e(nombre)}">'
+            f'{extra}<button class="{"sec" if sec else ""}">{texto}</button></form> ')
+
+
+def vista_routers(editar=None, aviso=None):
+    inv = _inventario()
+    filas = []
+    for nombre, r in inv["routers"].items():
+        cats = "<br>".join(f"{e(c)}: {e(', '.join(v))}" for c, v in r.get("categorias", {}).items())
+        activo = r.get("activo", False)
+        conmutar = _post_router("/routers/activo", nombre, "Pausar muestreo" if activo else "Activar muestreo",
+                                "" if activo else '<input type="hidden" name="activo" value="on">', sec=activo)
+        filas.append(
+            f"<tr><td><b>{e(nombre)}</b></td><td>{e(r.get('host', ''))}:{r.get('puerto', 22)}</td>"
+            f"<td>{e(r.get('usuario', ''))}</td><td>{cats}</td><td>{e(r.get('exportador', '—'))}</td>"
+            f"<td>{'<span class=ok>activo</span>' if activo else '<span class=warn>en pausa</span>'}</td>"
+            f"<td><a class='btn' href='/routers?editar={quote(nombre)}'>Editar</a> {conmutar}"
+            + _post_router("/routers/borrar", nombre, "Eliminar",
+                           confirmar=f"¿Eliminar {nombre} del inventario? Las muestras guardadas no se borran.") + "</td></tr>")
+    tabla = ("<table><tr><th>Nombre</th><th>IP:puerto SSH</th><th>Usuario</th><th>Rangos</th><th>Exporta NetFlow desde</th>"
+             "<th>Muestreo</th><th></th></tr>" + "".join(filas) + "</table>") if filas else "<p class=mut>Todavía no hay routers.</p>"
+
+    r = inv["routers"].get(editar or "", {})
+    cats = r.get("categorias", {})
+    valor = lambda k, defecto="": e(str(r.get(k, defecto)))  # noqa: E731
+    titulo = f"Editar «{e(editar)}»" if r else "Agregar router"
+    formulario = f"""<form method="post" action="/routers/guardar" class=formulario>
+<input type="hidden" name="anterior" value="{e(editar) if r else ''}">
+<div class=rejilla>
+<label>Nombre (sin espacios)<input name="nombre" required pattern="[a-z0-9][a-z0-9-]{{0,39}}" placeholder="core-centro" value="{e(editar) if r else ''}"></label>
+<label>IP del router (SSH)<input name="host" required placeholder="192.0.2.1" value="{valor('host')}"></label>
+<label>Puerto SSH<input name="puerto" type="number" min="1" max="65535" value="{valor('puerto', 22)}"></label>
+<label>Usuario<input name="usuario" value="{valor('usuario', 'trafico')}"></label>
+</div>
+<label>Rangos residenciales (separados por coma o espacio)<input name="residencial" placeholder="100.64.0.0/22, 100.64.8.0/23"
+ value="{e(', '.join(cats.get('residencial', [])))}"></label>
+<label>Rangos empresariales (opcional)<input name="empresarial" placeholder="198.51.100.0/26" value="{e(', '.join(cats.get('empresarial', [])))}"></label>
+<label>IP desde la que exporta NetFlow (opcional; solo si no es la misma IP del router)<input name="exportador"
+ placeholder="vacío = la misma IP" value="{valor('exportador')}"></label>
+<label class=check><input type="checkbox" name="activo" {'checked' if r.get('activo') else ''}> Muestreo automático en las franjas del día</label>
+<button>{'Guardar cambios' if r else 'Agregar router'}</button> {'<a href="/routers">Cancelar</a>' if r else ''}
+</form>"""
+    return pagina("Routers", f"""<h1>Routers</h1>
+<div class=card><h2>Inventario</h2>{tabla}</div>
+<div class=card><h2>{titulo}</h2>
+<p class=mut>Antes, en el router, pegar los comandos de <a href="/">Panel → Conectar un router</a>. Después de agregarlo:
+Panel → <b>Probar conexión</b>.</p>{formulario}</div>""", "/routers", aviso=aviso)
 
 
 def vista_muestras():
@@ -393,13 +448,15 @@ conexiones abre cada abonado. Con ese perfil se diseña el firewall de la catego
 <li>Cada noche sale un informe nuevo con la ventana móvil de 7 días: comparando informes se ve cómo cambia el uso.</li>
 <li>Retención: las muestras crudas y los logs de tareas se borran a los 14 días; los informes se guardan siempre.</li></ul></div>
 <div class=card><h2>Programación</h2>
-<p>Por router se habilita <code>mtp-recolectar@&lt;router&gt;.timer</code>: franjas 09:00, 15:00, 20:30 y 21:30 (hora de Ecuador),
-4 muestras cada 15 min por franja. Una semana en todas las franjas es la base mínima para diseñar.</p></div>
+<p>El timer <code>mtp-recolectar.timer</code> muestrea todos los routers con <b>Muestreo automático</b> activado: franjas 09:00, 15:00,
+20:30 y 21:30 (hora de Ecuador), 4 muestras cada 15 min por franja. Una semana en todas las franjas es la base mínima para diseñar.</p></div>
 <div class=card><h2>Agregar un router</h2><ol>
 <li>En el router: pegar los comandos de la tarjeta <b>Conectar un router</b> del Panel (RouterOS 7 o 6). Crean el usuario
 <code>trafico</code> del grupo <code>read</code>, limitado a la IP de este servidor, con la llave de este servidor y sin clave.</li>
-<li>En el servidor: agregarlo a <code>/etc/mikrotik-traffic-profiler/inventario.json</code> con host, puerto, usuario <code>trafico</code> y los CIDR de cada categoría.</li>
-<li>Panel → Descubrir y Contar. Si todo cuadra: <code>systemctl enable --now mtp-recolectar@&lt;router&gt;.timer</code>.</li></ol></div>
+<li>Pestaña <b>Routers</b> → formulario: nombre, IP y puerto SSH, rangos residenciales y empresariales y, si el router exporta NetFlow
+desde otra IP, esa IP.</li>
+<li>Panel → <b>Probar conexión</b> (debe salir la identidad y la versión del router) → <b>Descubrir</b> y <b>Contar</b>.</li>
+<li>Si todo cuadra, en Routers → <b>Activar muestreo</b>. Desde ahí se muestrea solo en cada franja.</li></ol></div>
 <div class=card><h2>Cómo leer el informe</h2><ul>
 <li>Pesa el <b>% de abonados</b>, no los bytes: lo que usa mucha gente no se bloquea.</li>
 <li>Lo muy corto (DNS, NTP) sale poco en una foto: su ausencia no prueba que nadie lo use.</li>
@@ -475,6 +532,8 @@ class Manejador(BaseHTTPRequestHandler):
             return self._enviar(200, vista_informes())
         if url.path == "/doc":
             return self._enviar(200, pagina("Documentación", DOC, "/doc"))
+        if url.path == "/routers":
+            return self._enviar(200, vista_routers(q.get("editar"), q.get("aviso")))
         rutas = {"/informe": ("informes", r"^[\w.-]+\.json$"), "/lectura": ("informes", r"^[\w.-]+-lectura\.md$"),
                  "/descubrimiento": ("descubrimiento", r"^[\w.-]+\.txt$"), "/tarea": ("tareas", r"^[\w.-]+\.log$")}
         if url.path in rutas:
@@ -509,10 +568,15 @@ class Manejador(BaseHTTPRequestHandler):
             return self._ir("/entrar", {"Set-Cookie": "mtp_sesion=; HttpOnly; SameSite=Strict; Path=/; Max-Age=0"})
         if not self._usuario():
             return self._ir("/entrar")
+        origen = self.headers.get("Origin")
+        if origen and urlparse(origen).netloc != self.headers.get("Host"):
+            return self._enviar(403, pagina("Prohibido", "<h1>Origen no permitido</h1>"))
+        if url.path.startswith("/routers/"):
+            return self._ir("/routers?aviso=" + quote(self._routers(url.path, f)))
         if url.path == "/accion":
             accion, router, categoria = f.get("accion"), f.get("router") or None, f.get("categoria") or None
             inv = _inventario()
-            if accion not in {"descubrir", "contar", "recolectar", "analizar"}:
+            if accion not in {"probar", "descubrir", "contar", "recolectar", "analizar"}:
                 msg = "Acción desconocida."
             elif accion != "analizar" and router not in inv.get("routers", {}):
                 msg = "Ese router no está en el inventario."
@@ -524,6 +588,37 @@ class Manejador(BaseHTTPRequestHandler):
                 msg = lanzar(accion, router if accion != "analizar" else None, categoria)
             return self._ir("/?aviso=" + quote(msg))
         return self._enviar(404, pagina("No encontrado", "<h1>No encontrado</h1>"))
+
+    def _routers(self, ruta, f):
+        """Alta, edición, borrado y pausa de routers. Devuelve el mensaje para el modal."""
+        with _CANDADO:
+            inv = _inventario()
+            nombre = f.get("nombre", "")
+            if ruta == "/routers/guardar":
+                try:
+                    nuevo, router = inventario.router_desde_form(f)
+                except ValueError as err:
+                    return str(err)
+                anterior = f.get("anterior") or ""
+                if nuevo != anterior and nuevo in inv["routers"]:
+                    return f"Ya existe un router llamado «{nuevo}»."
+                if anterior and anterior != nuevo:
+                    inv["routers"].pop(anterior, None)
+                existia = nuevo in inv["routers"] or bool(anterior)
+                inv["routers"][nuevo] = router
+                inventario.guardar(CFG["inventario"], inv)
+                return f"Router «{nuevo}» {'actualizado' if existia else 'agregado'}. Siguiente paso: Probar conexión en el Panel."
+            if nombre not in inv["routers"]:
+                return "Ese router no está en el inventario."
+            if ruta == "/routers/borrar":
+                del inv["routers"][nombre]
+                inventario.guardar(CFG["inventario"], inv)
+                return f"Router «{nombre}» eliminado. Sus muestras guardadas se conservan hasta la limpieza de 14 días."
+            if ruta == "/routers/activo":
+                inv["routers"][nombre]["activo"] = f.get("activo") == "on"
+                inventario.guardar(CFG["inventario"], inv)
+                return f"Muestreo de «{nombre}» {'activado' if inv['routers'][nombre]['activo'] else 'en pausa'}."
+        return "Acción desconocida."
 
 
 def main():
