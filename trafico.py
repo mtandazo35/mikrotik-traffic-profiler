@@ -5,6 +5,7 @@
   python trafico.py contar     --router NOMBRE --categoria residencial
   python trafico.py recolectar --router NOMBRE --categoria residencial [--repetir 4 --intervalo 15]
   python trafico.py analizar   --categoria residencial [--router A --router B] [--ip2asn data/ip2asn-v4.tsv.gz]
+  python trafico.py limpiar    [--dias 14]    # retención: borra crudo y logs viejos, conserva informes
   python trafico.py asn        [--dias 7]     # descarga/refresca data/ip2asn-v4.tsv.gz (iptoasn.com)
 """
 import argparse
@@ -56,6 +57,10 @@ def main():
     a.add_argument("--categoria", required=True)
     a.add_argument("--router", action="append")
     a.add_argument("--ip2asn", type=Path, help="TSV de iptoasn.com (ip2asn-v4.tsv.gz)")
+    a.add_argument("--dias", type=float, help="solo muestras de los últimos N días (por defecto, todas)")
+
+    lm = sub.add_parser("limpiar", help="borrar muestras crudas y logs de más de N días (los informes quedan)")
+    lm.add_argument("--dias", type=float, default=14)
 
     s = sub.add_parser("asn", help="descargar la tabla IP→ASN si falta o tiene más de N días")
     s.add_argument("--dias", type=float, default=7)
@@ -77,13 +82,17 @@ def main():
         print(f"{destino} descargado ({destino.stat().st_size // 1024} KiB)")
         return
 
+    if args.orden == "limpiar":
+        print(f"{analizar.limpiar(args.datos, args.dias)} muestras borradas (más de {args.dias:g} días)")
+        return
+
     if args.orden == "analizar":
         asn = None
         if args.ip2asn and args.ip2asn.exists():
             asn = analizar.Asn(args.ip2asn)
         elif args.ip2asn:
             print(f"aviso: no existe {args.ip2asn}; destinos agrupados por /16", file=sys.stderr)
-        perfil = analizar.analizar(args.datos, args.categoria, args.router, asn)
+        perfil = analizar.analizar(args.datos, args.categoria, args.router, asn, args.dias)
         if not perfil["resumen"]["muestras"]:
             sys.exit(f"no hay muestras de {args.categoria!r} en {args.datos / 'crudo'}")
         print(analizar.guardar(perfil, args.datos))

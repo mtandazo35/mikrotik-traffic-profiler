@@ -56,10 +56,16 @@ _EXACTOS = {
     ("tcp", 8883): "MQTT/TLS",
     ("udp", 69): "TFTP",
     ("udp", 161): "SNMP",
+    ("tcp", 554): "RTSP (cámaras)",
+    ("tcp", 34567): "DVR XMEye",
+    ("tcp", 37777): "DVR/cámara Dahua",
+    ("tcp", 8000): "DVR/cámara Hikvision",
 }
 
 _RANGOS = [
     ("udp", 3478, 3481, "STUN/TURN (videollamadas, consolas)"),
+    ("tcp", 6881, 6889, "BitTorrent"),
+    ("udp", 6881, 6889, "BitTorrent"),
     ("udp", 19302, 19309, "STUN Google (Meet/Hangouts)"),
     ("udp", 8801, 8810, "Zoom"),
     ("udp", 27000, 27050, "Steam / juegos Valve"),

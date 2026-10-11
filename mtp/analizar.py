@@ -16,6 +16,10 @@ _SENSIBLES_SALIENTES = {("tcp", 25), ("tcp", 23), ("tcp", 2323), ("tcp", 445), (
                         ("udp", 137), ("udp", 138), ("tcp", 3389), ("tcp", 5900), ("tcp", 7547)}
 _REFLECTORES = {53, 123, 1900, 11211, 19, 389, 161, 5353}
 _UMBRAL_BARRIDO = 50  # destinos distintos al mismo puerto en una sola muestra
+_PUERTOS_DNS = {("udp", 53), ("tcp", 53), ("tcp", 853), ("udp", 853)}
+# UDP alto que NO es P2P: QUIC, STUN/TURN, STUN de Google
+_UDP_NO_P2P = {443, *range(3478, 3482), *range(19302, 19310)}
+_UMBRAL_P2P = 100  # pares UDP distintos de un abonado en una muestra
 
 
 class Asn:
@@ -52,16 +56,43 @@ def percentiles(valores, puntos=(50, 90, 99, 99.9)):
     return salida
 
 
-def muestras(datos, categoria, routers=None):
-    """(router, ts, cidr, ruta) de cada muestra válida del manifiesto."""
+def marca_desde(dias, ahora=None):
+    """Marca 'AAAAmmdd-HHMMSS' de hace N días, comparable como texto con las de las muestras."""
+    return datetime.fromtimestamp((ahora or datetime.now().timestamp()) - dias * 86400).strftime("%Y%m%d-%H%M%S")
+
+
+def muestras(datos, categoria, routers=None, desde=None):
+    """(router, ts, cidr, ruta) de cada muestra guardada, opcionalmente desde una marca de tiempo."""
     for manifiesto in sorted(Path(datos, "crudo").glob(f"*/{categoria}/muestras.jsonl")):
         router = manifiesto.parent.parent.name
         if routers and router not in routers:
             continue
         for linea in manifiesto.read_text(encoding="utf-8").splitlines():
             m = json.loads(linea)
+            ruta = manifiesto.parent / m.get("archivo", "")
+            if m.get("archivo") and (not desde or m["ts"] >= desde) and ruta.is_file():
+                yield router, m["ts"], m["cidr"], ruta
+
+
+def limpiar(datos, dias):
+    """Borra muestras crudas y logs de tareas más viejos que N días. Los informes se conservan."""
+    corte = marca_desde(dias)
+    borradas = 0
+    for manifiesto in Path(datos, "crudo").glob("*/*/muestras.jsonl"):
+        quedan = []
+        for linea in manifiesto.read_text(encoding="utf-8").splitlines():
+            m = json.loads(linea)
+            if m.get("ts", "") >= corte:
+                quedan.append(linea)
+                continue
             if m.get("archivo"):
-                yield router, m["ts"], m["cidr"], manifiesto.parent / m["archivo"]
+                (manifiesto.parent / m["archivo"]).unlink(missing_ok=True)
+                borradas += 1
+        manifiesto.write_text("".join(f"{x}\n" for x in quedan), encoding="utf-8")
+    for log in Path(datos, "tareas").glob("*.log"):
+        if log.name[:15] < corte:
+            log.unlink()
+    return borradas
 
 
 def leer_muestra(ruta):
@@ -75,7 +106,13 @@ def _nuevo():
     return {"conexiones": 0, "abonados": set(), "bytes": 0}
 
 
-def analizar(datos, categoria, routers=None, asn=None):
+def _sumar(fila, abonado, bytes_):
+    fila["conexiones"] += 1
+    fila["abonados"].add(abonado)
+    fila["bytes"] += bytes_
+
+
+def analizar(datos, categoria, routers=None, asn=None, dias=None):
     destino_de = asn or _por_prefijo16
     salientes = defaultdict(_nuevo)
     entrantes = defaultdict(_nuevo)
@@ -84,15 +121,19 @@ def analizar(datos, categoria, routers=None, asn=None):
     por_abonado = []  # una fila por (muestra, abonado)
     senales = defaultdict(lambda: defaultdict(lambda: {"conexiones": 0, "destinos": set()}))
     barridos = []
+    dns = defaultdict(_nuevo)  # (proto, puerto, ip del resolver)
+    no_publicos = defaultdict(_nuevo)  # /24 privada o reservada que no es de la categoría
+    p2p = []
     horas = set()
     total = 0
     abonados_total = set()
 
-    for router, ts, cidr, ruta in muestras(datos, categoria, routers):
+    for router, ts, cidr, ruta in muestras(datos, categoria, routers, marca_desde(dias) if dias is not None else None):
         redes = [ipaddress.ip_network(cidr, strict=False)]
         horas.add(ts[9:11])
         por_router[router]["muestras"] += 1
-        en_muestra = defaultdict(lambda: {"conexiones": 0, "udp": 0, "puertos": set(), "ips": set(), "syn": 0})
+        en_muestra = defaultdict(lambda: {"conexiones": 0, "udp": 0, "puertos": set(), "ips": set(), "syn": 0,
+                                          "peers_udp": set()})
         destinos_por_puerto = defaultdict(set)
         for con in leer(leer_muestra(ruta)):
             c = clasificar(con, redes)
@@ -120,6 +161,12 @@ def analizar(datos, categoria, routers=None, asn=None):
                     a["puertos"].add((con.proto, puerto))
                 a["ips"].add(con.dst)
                 destinos_por_puerto[(abonado, con.proto, puerto)].add(con.dst)
+                if con.proto == "udp" and puerto is not None and puerto >= 1024 and puerto not in _UDP_NO_P2P:
+                    a["peers_udp"].add(con.dst)
+                if (con.proto, puerto) in _PUERTOS_DNS:
+                    _sumar(dns[(con.proto, puerto, con.dst)], abonado, bytes_)
+                if not con.dst.is_global:
+                    _sumar(no_publicos[str(ipaddress.ip_network(f"{con.dst}/24", strict=False))], abonado, bytes_)
                 if (con.proto, puerto) in _SENSIBLES_SALIENTES:
                     s = senales[f"{con.proto}/{puerto} {servicios.nombre(con.proto, puerto)}"][str(abonado)]
                     s["conexiones"] += 1
@@ -139,9 +186,11 @@ def analizar(datos, categoria, routers=None, asn=None):
                 barridos.append({"router": router, "muestra": ts, "abonado": str(abonado),
                                  "puerto": f"{proto}/{puerto}", "servicio": servicios.nombre(proto, puerto),
                                  "destinos_distintos": len(ips)})
-        for a in en_muestra.values():
+        for abonado, a in en_muestra.items():
             por_abonado.append({"conexiones": a["conexiones"], "udp": a["udp"], "puertos": len(a["puertos"]),
-                                "ips": len(a["ips"]), "syn": a["syn"]})
+                                "ips": len(a["ips"]), "syn": a["syn"], "peers_udp": len(a["peers_udp"])})
+            if len(a["peers_udp"]) >= _UMBRAL_P2P:
+                p2p.append({"router": router, "muestra": ts, "abonado": str(abonado), "peers_udp": len(a["peers_udp"])})
 
     n_abonados = len(abonados_total) or 1
 
@@ -163,6 +212,7 @@ def analizar(datos, categoria, routers=None, asn=None):
             "abonados_observados": len(abonados_total),
             "conexiones_analizadas": total,
             "destinos_agrupados_por": "ASN" if asn else "prefijo /16 (sin ip2asn)",
+            "ventana_dias": dias,
         },
         "salientes": tabla(salientes, 80),
         "entrantes": tabla(entrantes, 40),
@@ -173,7 +223,18 @@ def analizar(datos, categoria, routers=None, asn=None):
             for k, v in sorted(destinos.items(), key=lambda kv: -len(kv[1]["abonados"]))[:50]
         ],
         "por_abonado": {campo: percentiles([f[campo] for f in por_abonado])
-                        for campo in ("conexiones", "udp", "puertos", "ips", "syn")},
+                        for campo in ("conexiones", "udp", "puertos", "ips", "syn", "peers_udp")},
+        "dns": [
+            {"proto": proto, "puerto": puerto, "servidor": str(ip), "red": destino_de(ip),
+             "abonados": len(v["abonados"]), "pct_abonados": round(100 * len(v["abonados"]) / n_abonados, 1),
+             "conexiones": v["conexiones"]}
+            for (proto, puerto, ip), v in sorted(dns.items(), key=lambda kv: -len(kv[1]["abonados"]))[:25]
+        ],
+        "destinos_no_publicos": [
+            {"red": k, "abonados": len(v["abonados"]), "conexiones": v["conexiones"], "bytes": v["bytes"]}
+            for k, v in sorted(no_publicos.items(), key=lambda kv: -len(kv[1]["abonados"]))[:30]
+        ],
+        "p2p": sorted(p2p, key=lambda f: -f["peers_udp"])[:30],
         "senales": {
             nombre_senal: sorted(({"abonado": ab, "conexiones": v["conexiones"], "destinos_distintos": len(v["destinos"])}
                                   for ab, v in filas.items()), key=lambda f: -f["conexiones"])
@@ -227,7 +288,8 @@ def markdown(p):
     out += ["", "## Por abonado y muestra (base para límites)", "",
             "| Métrica | p50 | p90 | p99 | p99.9 | máx |", "|---|---:|---:|---:|---:|---:|"]
     etiquetas = {"conexiones": "Conexiones salientes", "udp": "Conexiones UDP", "puertos": "Puertos destino distintos",
-                 "ips": "IP destino distintas", "syn": "TCP en syn-sent (sin respuesta)"}
+                 "ips": "IP destino distintas", "syn": "TCP en syn-sent (sin respuesta)",
+                 "peers_udp": "Pares UDP distintos (P2P)"}
     for campo, texto in etiquetas.items():
         v = p["por_abonado"].get(campo, {})
         out.append(f"| {texto} | {v.get('p50', '-')} | {v.get('p90', '-')} | {v.get('p99', '-')} | "
@@ -241,6 +303,16 @@ def markdown(p):
     for b in p["barridos"][:15]:
         out.append(f"- Barrido: {b['abonado']} en {b['router']} ({b['muestra']}) → {b['puerto']} {b['servicio']} "
                    f"hacia {b['destinos_distintos']} destinos distintos")
+    out += ["", "## DNS: a qué resolvers preguntan", "",
+            "| Proto/puerto | Servidor | Red | % abonados | Conexiones |", "|---|---|---|---:|---:|"]
+    for f in p.get("dns", []):
+        out.append(f"| {f['proto']}/{f['puerto']} | {f['servidor']} | {f['red']} | {f['pct_abonados']} | {f['conexiones']} |")
+    out += ["", "## Destinos no públicos (privados/reservados fuera de la categoría)", "",
+            "| Red /24 | Abonados | Conexiones |", "|---|---:|---:|"]
+    for f in p.get("destinos_no_publicos", []):
+        out.append(f"| {f['red']} | {f['abonados']} | {f['conexiones']} |")
+    out += ["", f"## Posible P2P (≥{_UMBRAL_P2P} pares UDP en una muestra)", ""]
+    out += [f"- {f['abonado']} en {f['router']} ({f['muestra']}): {f['peers_udp']} pares" for f in p.get("p2p", [])] or ["Ninguno."]
     out += ["", "## Por router", "", "| Router | Muestras | Abonados | Conexiones |", "|---|---:|---:|---:|"]
     for nombre_router, v in p["por_router"].items():
         out.append(f"| {nombre_router} | {v['muestras']} | {v['abonados']} | {v['conexiones']} |")

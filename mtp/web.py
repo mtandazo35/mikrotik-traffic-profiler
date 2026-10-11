@@ -123,7 +123,7 @@ def lanzar(accion, router=None, categoria=None):
         if categoria:
             cmd += ["--categoria", categoria]
         if accion == "analizar":
-            cmd += ["--ip2asn", str(_datos("ip2asn-v4.tsv.gz"))]
+            cmd += ["--ip2asn", str(_datos("ip2asn-v4.tsv.gz")), "--dias", "7"]
         _datos("tareas").mkdir(parents=True, exist_ok=True)
         nombre = f"{datetime.now():%Y%m%d-%H%M%S}-{accion}-{router or 'todos'}.log"
         log = _datos("tareas", nombre).open("w", encoding="utf-8")
@@ -272,7 +272,7 @@ servidor con otra IP (NAT o VPN de por medio), cambiar <code>address=</code> por
     return pagina("Panel", f"""
 <h1>Panel</h1>
 <div class=card><h2>Routers</h2>{routers}</div>
-<div class=card><h2>Análisis</h2><p class=mut>Genera el perfil con todas las muestras guardadas. También corre solo cada noche.</p>{analizar}</div>
+<div class=card><h2>Análisis</h2><p class=mut>Genera el perfil con las muestras de los últimos 7 días. También corre solo cada noche a las 23:30.</p>{analizar}</div>
 <div class=card><h2>Tareas recientes</h2>{'<table>' + ''.join(tareas) + '</table>' if tareas else '<p class=mut>Sin tareas todavía.</p>'}</div>
 <div class=card><h2>Programación (systemd)</h2><pre>{e(_timers())}</pre></div>
 <div class=card><h2>Conectar un router</h2>{conectar}</div>
@@ -327,7 +327,14 @@ def vista_informe(ruta):
     p = json.loads(ruta.read_text(encoding="utf-8"))
     r = p["resumen"]
     etiquetas = {"conexiones": "Conexiones salientes", "udp": "Conexiones UDP", "puertos": "Puertos destino distintos",
-                 "ips": "IP destino distintas", "syn": "TCP sin respuesta (syn-sent)"}
+                 "ips": "IP destino distintas", "syn": "TCP sin respuesta (syn-sent)",
+                 "peers_udp": "Pares UDP distintos (P2P)"}
+    dns = "".join(f"<tr><td>{e(f['proto'])}/{f['puerto']}</td><td>{e(f['servidor'])}</td><td>{e(f['red'])}</td>"
+                  f"<td class=n>{f['pct_abonados']}</td><td class=n>{f['conexiones']}</td></tr>" for f in p.get("dns", []))
+    no_pub = "".join(f"<tr><td>{e(f['red'])}</td><td class=n>{f['abonados']}</td><td class=n>{f['conexiones']}</td></tr>"
+                     for f in p.get("destinos_no_publicos", []))
+    p2p = "".join(f"<li>{e(f['abonado'])} en {e(f['router'])} ({e(f['muestra'])}): {f['peers_udp']} pares UDP</li>"
+                  for f in p.get("p2p", []))
     percent = "".join(
         f"<tr><td>{t}</td>" + "".join(f"<td class=n>{p['por_abonado'].get(k, {}).get(c, '-')}</td>"
                                       for c in ("p50", "p90", "p99", "p99.9", "max")) + "</tr>"
@@ -353,6 +360,11 @@ Destinos por {e(r['destinos_agrupados_por'])}</p>
 <th class=n>p99</th><th class=n>p99.9</th><th class=n>máx</th></tr>{percent}</table></div>
 <div class=card><h2>Señales a revisar</h2><ul>{senales or '<li class=mut>Sin señales.</li>'}</ul></div>
 <div class=card><h2>Destinos</h2><table><tr><th>Destino</th><th class=n>% abonados</th><th class=n>Conexiones</th><th class=n>Bytes</th></tr>{destinos}</table></div>
+<div class=card><h2>DNS: a qué resolvers preguntan</h2><p class=mut>Si mucha gente usa resolvers externos o DNS cifrado (853), el DNS forzado por dst-nat no los alcanza.</p>
+<table><tr><th>Proto/puerto</th><th>Servidor</th><th>Red</th><th class=n>% abonados</th><th class=n>Conexiones</th></tr>{dns or '<tr><td colspan=5 class=mut>Nada.</td></tr>'}</table></div>
+<div class=card><h2>Destinos no públicos</h2><p class=mut>Redes privadas o reservadas fuera de la categoría: servicios internos del ISP, rutas mal puestas o fugas.</p>
+<table><tr><th>Red /24</th><th class=n>Abonados</th><th class=n>Conexiones</th></tr>{no_pub or '<tr><td colspan=3 class=mut>Nada.</td></tr>'}</table></div>
+<div class=card><h2>Posible P2P</h2><ul>{p2p or '<li class=mut>Ninguno.</li>'}</ul></div>
 <div class=card><h2>Por router</h2><table><tr><th>Router</th><th class=n>Muestras</th><th class=n>Abonados</th><th class=n>Conexiones</th></tr>{routers}</table></div>
 """, "/informes")
 
@@ -375,7 +387,11 @@ conexiones abre cada abonado. Con ese perfil se diseña el firewall de la catego
 <li><b>Descubrir</b>: vuelca pools, direcciones, NAT, filtros, mangle, colas y ajustes de conntrack. Sirve para ubicar el punto de inserción.</li>
 <li><b>Contar</b>: cuántas conexiones tiene ahora cada CIDR de la categoría, sin descargar nada.</li>
 <li><b>Muestrear</b>: una foto de conntrack de la categoría (comprimida). Las fotos programadas son 4 seguidas cada 15 min.</li>
-<li><b>Analizar</b>: genera el perfil con todas las muestras. Corre también cada noche a las 23:30.</li></ul></div>
+<li><b>Analizar</b>: genera el perfil con las muestras de los últimos 7 días. Corre también cada noche a las 23:30.</li></ul></div>
+<div class=card><h2>Funcionamiento permanente</h2><ul>
+<li>Cada router con su timer activo se muestrea todos los días, sin fecha de fin.</li>
+<li>Cada noche sale un informe nuevo con la ventana móvil de 7 días: comparando informes se ve cómo cambia el uso.</li>
+<li>Retención: las muestras crudas y los logs de tareas se borran a los 14 días; los informes se guardan siempre.</li></ul></div>
 <div class=card><h2>Programación</h2>
 <p>Por router se habilita <code>mtp-recolectar@&lt;router&gt;.timer</code>: franjas 09:00, 15:00, 20:30 y 21:30 (hora de Ecuador),
 4 muestras cada 15 min por franja. Una semana en todas las franjas es la base mínima para diseñar.</p></div>
