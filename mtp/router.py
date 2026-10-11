@@ -80,7 +80,12 @@ def ejecutar(router, comando, timeout=300):
     r = subprocess.run(cmd, input=entrada, capture_output=True, text=True, timeout=timeout,
                        encoding="utf-8", errors="replace")
     if r.returncode != 0:
-        raise RuntimeError(f"{router['host']}: `{comando}` salió con {r.returncode}: {r.stderr.strip()[-400:]}")
+        detalle = r.stderr.strip()[-400:]
+        if r.returncode == 255 and not detalle:
+            # el router acepta TCP y cierra antes del saludo SSH: casi siempre /ip service ssh address= o firewall input
+            detalle = ("el router cerró la conexión antes de autenticar; revisar en el router "
+                       "`/ip service print where name=ssh` (address debe incluir la IP de este servidor) y el firewall input")
+        raise RuntimeError(f"{router['host']}: `{comando}` salió con {r.returncode}: {detalle}")
     return r.stdout
 
 
