@@ -69,7 +69,9 @@ def main():
             return
         destino.parent.mkdir(parents=True, exist_ok=True)
         temporal = destino.with_suffix(".parcial")
-        with urllib.request.urlopen(URL_IP2ASN, timeout=120) as r, temporal.open("wb") as f:
+        # iptoasn.com responde 403 al User-Agent por defecto de urllib
+        pedido = urllib.request.Request(URL_IP2ASN, headers={"User-Agent": "mikrotik-traffic-profiler/1.0"})
+        with urllib.request.urlopen(pedido, timeout=120) as r, temporal.open("wb") as f:
             f.write(r.read())
         temporal.replace(destino)
         print(f"{destino} descargado ({destino.stat().st_size // 1024} KiB)")
