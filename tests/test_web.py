@@ -24,6 +24,16 @@ class TestCredenciales(unittest.TestCase):
         self.assertIsNone(web.sesion_valida(t, "s3creto", ahora=1000 + 9 * 3600))
         self.assertIsNone(web.sesion_valida(t.replace("admin", "root"), "s3creto", ahora=1001))
 
+    def test_comandos_router(self):
+        v7, v6, ver, quitar = web.comandos_router("ssh-rsa AAAAprueba mtp@x", "192.0.2.8")
+        for bloque in (v7, v6):
+            self.assertIn('contents="ssh-rsa AAAAprueba mtp@x"', bloque)
+            self.assertIn("group=read address=192.0.2.8/32", bloque)
+        self.assertIn("public-key-file=trafico.pub", v7)
+        self.assertIn("public-key-file=trafico.txt", v6)
+        self.assertNotIn("/file add", v6)  # no existe en RouterOS 6
+        self.assertIn("/user remove [find name=trafico]", quitar)
+
     def test_archivo_seguro(self):
         with tempfile.TemporaryDirectory() as d:
             (Path(d) / "a.json").write_text("{}")
@@ -76,6 +86,7 @@ class TestServidor(unittest.TestCase):
         st, _, cuerpo = self._pedir("GET", "/", cookie=cookie)
         self.assertEqual(st, 200)
         self.assertIn("core-a", cuerpo)
+        self.assertIn("Conectar un router", cuerpo)
         st, _, cuerpo = self._pedir("GET", "/doc", cookie=cookie)
         self.assertIn("Documentación", cuerpo)
         st, cab, _ = self._pedir("POST", "/accion", {"accion": "set", "router": "core-a"}, cookie=cookie)

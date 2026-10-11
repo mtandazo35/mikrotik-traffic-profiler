@@ -8,8 +8,10 @@ import hashlib
 import hmac
 import html
 import json
+import os
 import re
 import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -139,6 +141,28 @@ def lanzar(accion, router=None, categoria=None):
         return f"Tarea lanzada: {nombre}"
 
 
+def ip_origen():
+    """IP con la que este servidor sale a la red (no envía paquetes)."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(("192.0.2.1", 9))
+            return s.getsockname()[0]
+    except OSError:
+        return "IP_DE_ESTE_SERVIDOR"
+
+
+def comandos_router(llave, ip):
+    """Comandos para pegar en la terminal del MikroTik: (RouterOS 7, RouterOS 6, verificación, quitar)."""
+    usuario = f'/user add name=trafico group=read address={ip}/32 comment="perfilador de trafico - solo lectura"'
+    v7 = "\n".join([f'/file add name=trafico.pub contents="{llave}"', usuario,
+                    "/user ssh-keys import user=trafico public-key-file=trafico.pub"])
+    v6 = "\n".join(["/file print file=trafico", ":delay 2s", f'/file set trafico.txt contents="{llave}"', usuario,
+                    "/user ssh-keys import user=trafico public-key-file=trafico.txt"])
+    verificar = "\n".join(["/user print where name=trafico", "/user ssh-keys print", "/ip service print where name=ssh"])
+    quitar = "\n".join(["/user ssh-keys remove [find user=trafico]", "/user remove [find name=trafico]"])
+    return v7, v6, verificar, quitar
+
+
 # ---------- HTML ----------
 
 e = html.escape
@@ -159,8 +183,18 @@ button,.btn{background:var(--acc);color:#fff;border:0;border-radius:6px;padding:
 button.sec{background:transparent;color:var(--acc);border:1px solid var(--acc)}form.inl{display:inline}
 .ok{color:var(--ok)}.warn{color:var(--warn)}.bad{color:var(--bad)}
 input{font:inherit;padding:6px 8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--fg);width:100%;margin:4px 0 10px}
+.copiable{position:relative}.copiable button{position:absolute;top:6px;right:6px}.copiable pre{padding-right:80px;white-space:pre-wrap;word-break:break-all}
 dialog{border:1px solid var(--line);border-radius:8px;background:var(--card);color:var(--fg);max-width:520px}dialog::backdrop{background:#0008}
 """
+
+
+JS = """function copiar(id, b) {
+  const t = document.getElementById(id).innerText;
+  const listo = () => { b.textContent = "Copiado"; setTimeout(() => b.textContent = "Copiar", 1500); };
+  if (navigator.clipboard && window.isSecureContext) { navigator.clipboard.writeText(t).then(listo); return; }
+  const a = document.createElement("textarea"); a.value = t; document.body.appendChild(a); a.select();
+  document.execCommand("copy"); a.remove(); listo();
+}"""
 
 
 def pagina(titulo, cuerpo, activa="", aviso=None, refresco=None):
@@ -175,7 +209,7 @@ def pagina(titulo, cuerpo, activa="", aviso=None, refresco=None):
             f'content="width=device-width,initial-scale=1">{meta}<title>{e(titulo)} · Perfil de tráfico</title>'
             f'<style>{CSS}</style></head><body><header><b>Perfil de tráfico MikroTik</b><nav>{nav}</nav>'
             f'<form class="inl" method="post" action="/salir" style="margin-left:auto"><button class="sec">Salir</button></form>'
-            f'</header><main>{cuerpo}</main>{modal}</body></html>')
+            f'</header><main>{cuerpo}</main>{modal}<script>{JS}</script></body></html>')
 
 
 def _boton(accion, texto, router="", categoria="", sec=False, confirmar=None):
@@ -219,15 +253,35 @@ def vista_panel(aviso=None):
             else "<span class=bad>revisar</span>")
         tareas.append(f"<tr><td><a href='/tarea?f={quote(nombre)}'>{e(nombre)}</a></td><td>{estado}</td></tr>")
     llave = Path(CFG.get("llave_publica", ""))
-    llave_txt = llave.read_text().strip() if llave.is_file() else "(no encontrada)"
+    if llave.is_file():
+        ip = CFG.get("ip_origen") or "IP_DE_ESTE_SERVIDOR"
+        v7, v6, verificar, quitar = comandos_router(llave.read_text().strip(), ip)
+        conectar = f"""<p>Pegar en la terminal del MikroTik (Winbox → New Terminal) como administrador. Crea el usuario
+<code>trafico</code> del grupo <code>read</code> (no puede cambiar nada) que solo acepta conexiones desde <b>{e(ip)}</b>,
+y le carga la llave de este servidor. No lleva clave.</p>
+<h3>RouterOS 7</h3>{_copiable("cmd-v7", v7)}
+<h3>RouterOS 6</h3>{_copiable("cmd-v6", v6)}
+<h3>Comprobar</h3>{_copiable("cmd-ver", verificar)}
+<p class=mut>Debe salir el usuario <code>trafico</code> con una llave RSA, y el servicio <code>ssh</code> habilitado. Si ese servicio
+tiene <code>address</code> restringido, o el firewall <code>input</code> filtra SSH, hay que permitir {e(ip)}. Si el router ve a este
+servidor con otra IP (NAT o VPN de por medio), cambiar <code>address=</code> por esa IP.</p>
+<h3>Quitar el acceso</h3>{_copiable("cmd-quitar", quitar)}
+<p class=mut>Hecho esto, pasar IP, puerto SSH y rangos de cada categoría para darlo de alta en el inventario.</p>"""
+    else:
+        conectar = "<p class=bad>No se encontró la llave pública del servidor (reinstalar con deploy/install.sh).</p>"
     return pagina("Panel", f"""
 <h1>Panel</h1>
 <div class=card><h2>Routers</h2>{routers}</div>
 <div class=card><h2>Análisis</h2><p class=mut>Genera el perfil con todas las muestras guardadas. También corre solo cada noche.</p>{analizar}</div>
 <div class=card><h2>Tareas recientes</h2>{'<table>' + ''.join(tareas) + '</table>' if tareas else '<p class=mut>Sin tareas todavía.</p>'}</div>
 <div class=card><h2>Programación (systemd)</h2><pre>{e(_timers())}</pre></div>
-<div class=card><h2>Llave pública para los routers</h2><p class=mut>Importarla en un usuario del grupo <code>read</code> limitado a la IP de este servidor.</p><pre>{e(llave_txt)}</pre></div>
+<div class=card><h2>Conectar un router</h2>{conectar}</div>
 """, "/", aviso=aviso)
+
+
+def _copiable(ident, texto):
+    return (f'<div class=copiable><button class=sec data-id="{ident}" onclick="copiar(this.dataset.id, this)">Copiar</button>'
+            f'<pre id="{ident}">{e(texto)}</pre></div>')
 
 
 def vista_muestras():
@@ -326,8 +380,8 @@ conexiones abre cada abonado. Con ese perfil se diseña el firewall de la catego
 <p>Por router se habilita <code>mtp-recolectar@&lt;router&gt;.timer</code>: franjas 09:00, 15:00, 20:30 y 21:30 (hora de Ecuador),
 4 muestras cada 15 min por franja. Una semana en todas las franjas es la base mínima para diseñar.</p></div>
 <div class=card><h2>Agregar un router</h2><ol>
-<li>En el router: <code>/user add name=trafico group=read address=IP_DE_ESTE_SERVIDOR/32</code> e importar la llave pública que muestra el Panel
-(<code>/user ssh-keys import user=trafico public-key-file=trafico.pub</code>).</li>
+<li>En el router: pegar los comandos de la tarjeta <b>Conectar un router</b> del Panel (RouterOS 7 o 6). Crean el usuario
+<code>trafico</code> del grupo <code>read</code>, limitado a la IP de este servidor, con la llave de este servidor y sin clave.</li>
 <li>En el servidor: agregarlo a <code>/etc/mikrotik-traffic-profiler/inventario.json</code> con host, puerto, usuario <code>trafico</code> y los CIDR de cada categoría.</li>
 <li>Panel → Descubrir y Contar. Si todo cuadra: <code>systemctl enable --now mtp-recolectar@&lt;router&gt;.timer</code>.</li></ol></div>
 <div class=card><h2>Cómo leer el informe</h2><ul>
@@ -462,6 +516,8 @@ def main():
     p.add_argument("--inventario", default=str(RAIZ / "inventario.json"))
     p.add_argument("--datos", default=str(RAIZ / "data"))
     p.add_argument("--llave-publica", default="")
+    p.add_argument("--ip-origen", default=os.environ.get("IP_ORIGEN") or None,
+                   help="IP con la que los routers ven a este servidor (por defecto, la de salida)")
     p.add_argument("--escuchar", default="0.0.0.0")
     p.add_argument("--puerto", type=int, default=8080)
     p.add_argument("--cambiar-clave", action="store_true", help="lee la clave nueva de stdin y guarda su hash")
@@ -479,7 +535,7 @@ def main():
         return
 
     CFG.update(json.loads(a.config.read_text()))
-    CFG.update(inventario=a.inventario, datos=a.datos, llave_publica=a.llave_publica)
+    CFG.update(inventario=a.inventario, datos=a.datos, llave_publica=a.llave_publica, ip_origen=a.ip_origen or ip_origen())
     servidor = ThreadingHTTPServer((a.escuchar, a.puerto), Manejador)
     print(f"panel en http://{a.escuchar}:{a.puerto}", flush=True)
     servidor.serve_forever()
